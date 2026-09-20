@@ -1,0 +1,6 @@
+/codex_poll_data/
+memory.sqlite3*
+__pycache__/
+*.py[cod]
+*.log
+*.jsonl
