@@ -12,7 +12,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && install -d -o node -g node -m 0700 /app/any/data
 WORKDIR /app
-COPY codex_board.py codex_client.py codex_memory.py codex_mouse.py codex_notify.py codex_poll.py codex_tasks.py codex_ui.py ./
+COPY codex_board.py codex_client.py codex_memory.py codex_mouse.py codex_notify.py codex_poll.py codex_tasks.py codex_ui.py logic_questions.json ./
 COPY --from=build /build/any/dist ./any/dist
 COPY any/server.mjs any/python-bridge.mjs any/python_scheduler.py ./any/
 ENV NODE_ENV=production \

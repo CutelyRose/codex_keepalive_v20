@@ -11,9 +11,8 @@ export class PythonBridge {
     this.child = spawn(process.env.ANYROUTER_PYTHON || (process.platform === 'win32' ? 'python' : 'python3'), [
       '-B', '-u', '-X', 'utf8', fileURLToPath(new URL('./python_scheduler.py', import.meta.url)),
       '--db', dbPath, '--notification-url', notificationUrl,
-    ], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    ], { stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true,
       env: { ...process.env, ANYROUTER_INTERNAL_AUTH: authorization } });
-    this.child.stderr.resume();
     this.ready = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('Python 启动超时')), 15_000);
       this.startup = { resolve: () => { clearTimeout(timer); resolve(); }, reject: (error) => { clearTimeout(timer); reject(error); } };
