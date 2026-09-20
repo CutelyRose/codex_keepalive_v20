@@ -1,0 +1,29 @@
+name: anyrouter
+services:
+  anyrouter:
+    image: ${ANYROUTER_IMAGE:-ghcr.io/cutelyrose/codex_keepalive_v20:latest}
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${ANYROUTER_HTTP_PORT:-8787}:8787"
+    environment:
+      ANYROUTER_ORIGIN: "${ANYROUTER_ORIGIN:?Set ANYROUTER_ORIGIN}"
+      ANYROUTER_PASSWORD: "${ANYROUTER_PASSWORD:?Set ANYROUTER_PASSWORD}"
+      TZ: Asia/Shanghai
+    volumes:
+      - data:/app/any/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+volumes:
+  data:

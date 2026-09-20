@@ -1,0 +1,21 @@
+{
+  "name": "anyrouter-local-console",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "tsc --noEmit",
+    "prestart": "npm run build",
+    "start": "node server.mjs",
+    "pretest": "npm run build",
+    "test": "node --test tests/local.test.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2"
+  }
+}
