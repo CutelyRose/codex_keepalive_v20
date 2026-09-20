@@ -16,6 +16,7 @@ flowchart LR
   Python --> Notice
   Notice --> Telegram[Telegram Bot API]
   Notice --> ServerChan[Server 酱 API]
+  Notice --> ShowDoc[ShowDoc 推送 API]
 ```
 
 AppStore 合并两端任务。ID 与 scheduler 标识执行者，操作路由到拥有该任务的一端。筛选不转移或暂停任务；双端创建产生两个独立任务和会话。
@@ -61,8 +62,8 @@ healthy 保存最近轮次是否成功；attemptsMade 是累计实际请求数�
 
 | 参数 | 默认 | 范围 / 语义 |
 | --- | --- | --- |
-| maxAttempts | 300 | 1–10000，成功后重置探活预算 |
-| concurrency | 1 | 1–16，仅用于探活；保活单请求 |
+| maxAttempts | 300 | 正整数，不设固定最大值；成功后重置探活预算 |
+| concurrency | 1 | 正整数，不设固定最大值；仅用于探活，保活单请求 |
 | intervalSeconds | 2 | 0.5–3600 秒 |
 | timeoutSeconds | 120 | 30–600 秒，等待成功首事件 |
 | keepalive | true | 成功后持续保活 |
@@ -82,7 +83,7 @@ Python 最多同时执行 8 个轮次，未返回的物理请求仍占用位置�
 | --- | --- |
 | GET /api/health | 无需认证；检查 Python 调度线程，失败返回 503 |
 | POST /api/python/models | {baseUrl, token}，由 Python 鉴权并读取模型 |
-| GET /api/python/tasks | 任务概要，events 与 responseSummary 为空；不返回模型 Key、Bot Token 或 SendKey |
+| GET /api/python/tasks | 任务概要，events 与 responseSummary 为空；不返回模型 Key、ShowDoc 推送 URL、Bot Token 或 SendKey |
 | GET /api/python/tasks?detail={id} | 仅指定任务携带事件和响应摘要 |
 | POST /api/python/tasks | {config: TaskConfig, token}，创建任务 |
 | POST /api/python/tasks/{id}/pause | 暂停 |
@@ -106,10 +107,12 @@ Node 管理一个 Python 进程。退出时先保存状态，再终止请求。�
 
 两端向 POST /api/notifications 提交成功摘要，以“任务 ID:成功时间”去重；GET /api/notifications/{id} 返回回执。首次成功或失败后恢复成功时通知，持续成功不重复发送，冷却 300 秒。
 
-通知保存于 `data/notifications.sqlite`，状态 queued / retrying / sent / dead；内存只保存未完成通知，最多并行投递 4 条。每条最多尝试 5 次，遵守 Telegram retry_after 或 Server 酱 HTTP Retry-After，否则按 2/4/8/16 秒退避。永久错误停止重试。结束后清除 Bot Token、Chat ID、SendKey；历史回执按主键读取。Python 状态接口合并最新通知回执。
+通知保存于 `data/notifications.sqlite`，状态 queued / retrying / sent / dead；内存只保存未完成通知，最多并行投递 4 条。每条最多尝试 5 次，遵守 Telegram retry_after 或 ShowDoc / Server 酱 HTTP Retry-After，否则按 2/4/8/16 秒退避。永久错误停止重试。结束后清除 ShowDoc 推送 URL、Bot Token、Chat ID、SendKey；历史回执按主键读取。Python 状态接口合并最新通知回执。
+
+通知表单默认选择 ShowDoc，切换方式只显示相应参数，隐藏字段禁用并从提交内容中排除。ShowDoc 配置字段为 `showdocPushUrl`，通知队列输入字段为 `showdocUrl`；仅接受官方 `https://push.showdoc.com.cn/server/api/push/<推送密钥>` 地址。按 [ShowDoc 官方推送服务](https://push.showdoc.com.cn/)的调用方式，以表单 POST `title / content`；HTTP 成功且 `error_code === 0` 才标记 sent，业务错误读取 `error_message`。推送 URL 与其中的密钥参与日志脱敏。
 
 Server 酱请求与官方 serverchan-sdk 1.0.6 的 sc_send 协议一致：SCT 使用 `https://sctapi.ftqq.com/{sendkey}.send`；sctp 使用 `https://{uid}.push.ft07.com/send/{sendkey}.send`。Node 直接 POST JSON `title / desp / tags`，无需为共享队列增加 Python SDK 依赖。标题限 32 个 Unicode 字符，成功必须 HTTP 成功且 code 为 0，存在 data.errno 时也必须为 0。
 
 Docker / 1Panel 配置及单实例部署边界见 [DEPLOY.md](../DEPLOY.md)；性能数据见 [PERFORMANCE.md](PERFORMANCE.md)。镜像支持 amd64 / arm64，工作流在发布 latest 前检查容器认证和 SQLite 重启恢复。浏览器 UUID 统一通过 `crypto.getRandomValues` 生成，支持通过 HTTP 的服务器 IP 直接访问。
 
-`npm run check` 检查类型。`npm test` 使用独立临时数据和本机 HTTP 服务验证协议、SSE 首事件成功、系统代理、双端并行、保活恢复、稳定会话、暂停删除、Python 重启恢复、双通知平台、远程认证、概要与详情及浏览器写入合并，不访问真实上游。
+`npm run check` 检查类型。`npm test` 使用独立临时数据和本机 HTTP 服务验证协议、SSE 首事件成功、系统代理、双端超过 16 个请求的并发、大数值配置保存、保活恢复、稳定会话、暂停删除、Python 重启恢复、三种通知平台、远程认证、概要与详情及浏览器写入合并，不访问真实上游。

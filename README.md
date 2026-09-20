@@ -1,6 +1,6 @@
 # AnyRouter 双端调度与自动保活
 
-同一页面管理浏览器和 Python 任务，支持双端同时调度、成功后自动保活、Telegram / Server 酱通知，数据使用 SQLite。Python 任务在关闭页面后继续运行。
+同一页面管理浏览器和 Python 任务，支持双端同时调度、成功后自动保活、ShowDoc / Telegram / Server 酱通知，数据使用 SQLite。Python 任务在关闭页面后继续运行。探活次数与单轮并发不设固定最大值，按填写的正整数执行。
 
 ## 1Panel 部署
 

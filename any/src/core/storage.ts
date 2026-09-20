@@ -146,6 +146,7 @@ export function loadSettings(storage: Storage = localStorage): AppSettings {
     ),
     telegramChatId:
       typeof parsed.telegramChatId === 'string' ? parsed.telegramChatId.slice(0, 128) : '',
+    showdocPushUrl: typeof parsed.showdocPushUrl === 'string' ? parsed.showdocPushUrl.slice(0, 1024) : '',
     telegramBotToken:
       typeof parsed.telegramBotToken === 'string' ? parsed.telegramBotToken.slice(0, 256) : '',
     serverchanSendKey: typeof parsed.serverchanSendKey === 'string' ? parsed.serverchanSendKey.slice(0, 256) : '',
@@ -158,7 +159,7 @@ export function saveSettings(settings: AppSettings, storage: Storage = localStor
     keepalive: settings.keepalive,
     keepaliveMinSeconds: clampSetting('keepaliveMinSeconds', settings.keepaliveMinSeconds),
     keepaliveMaxSeconds: clampSetting('keepaliveMaxSeconds', settings.keepaliveMaxSeconds),
-    attempts: Math.min(LIMITS.attempts.max, Math.max(LIMITS.attempts.min, settings.attempts)),
+    attempts: clampSetting('attempts', settings.attempts),
     intervalSeconds: Math.min(
       LIMITS.intervalSeconds.max,
       Math.max(LIMITS.intervalSeconds.min, settings.intervalSeconds),
@@ -167,10 +168,7 @@ export function saveSettings(settings: AppSettings, storage: Storage = localStor
       LIMITS.timeoutSeconds.max,
       Math.max(LIMITS.timeoutSeconds.min, settings.timeoutSeconds),
     ),
-    concurrency: Math.min(
-      LIMITS.concurrency.max,
-      Math.max(LIMITS.concurrency.min, settings.concurrency),
-    ),
+    concurrency: clampSetting('concurrency', settings.concurrency),
     ...validateNotificationSettings(settings),
   };
   storage.setItem(STORAGE_KEYS.settings, JSON.stringify(normalized));

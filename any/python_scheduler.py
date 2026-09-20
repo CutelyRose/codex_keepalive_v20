@@ -133,7 +133,8 @@ class WebRuntime(Runtime):
                 stream=True, interval=config['intervalSeconds'], success_interval=config['keepaliveMinSeconds'],
                 success_interval_max=config['keepaliveMaxSeconds'], timeout=600., max_inflight=1, max_tokens=128,
                 tool_mode='off', token_param='auto', reset_session_on_400=False, prompts=[config['prompt']],
-                extra_headers={}, query_params={}, secrets=[key, config['telegramBotToken'], config.get('serverchanSendKey', '')],
+                extra_headers={}, query_params={}, secrets=[key, config['telegramBotToken'], config.get('serverchanSendKey', ''),
+                    config.get('showdocPushUrl', ''), config.get('showdocPushUrl', '').rsplit('/', 1)[-1]],
                 display_endpoint=request['url'], api_name=config['name'], web_config=config, web_request=request,
             )
             active = data['status'] in ('running', 'requesting', 'waiting', 'keepalive') or (
@@ -176,6 +177,7 @@ class WebRuntime(Runtime):
         if not private:
             data['config']['telegramBotToken'] = ''
             data['config']['serverchanSendKey'] = ''
+            data['config']['showdocPushUrl'] = ''
         return data
 
     def command(self, method, params):
@@ -442,6 +444,7 @@ class WebRuntime(Runtime):
                    'model': config['model'], 'keyTail': key[-4:], 'attempts': data['attemptsMade'],
                    'elapsedMs': data['acceptedAt'] - data['startedAt'], 'acceptedAt': data['acceptedAt'],
                    'chatId': config['telegramChatId'], 'botToken': config['telegramBotToken'],
+                   'showdocUrl': config.get('showdocPushUrl', ''),
                    'sendKey': config.get('serverchanSendKey', ''), 'tags': config.get('serverchanTags', '')}
         try:
             headers = {'Content-Type': 'application/json'}

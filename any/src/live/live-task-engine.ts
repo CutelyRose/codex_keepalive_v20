@@ -1,4 +1,4 @@
-import { LIMITS, MAX_EVENTS, MAX_RESPONSE_SUMMARY_BYTES } from '../core/constants';
+import { MAX_EVENTS, MAX_RESPONSE_SUMMARY_BYTES } from '../core/constants';
 import { notificationConfigured, validateTaskConfig } from '../core/task-config';
 import type {
   NotificationClient,
@@ -305,7 +305,7 @@ export class LiveTaskEngine {
 
     const token = this.getKey(task.config.keyId)?.trim();
     const generation = ++runtime.generation;
-    const laneCount = task.healthy ? 1 : laneCountFor(task.config, task.config.maxAttempts - task.probeAttempts);
+    const laneCount = task.healthy ? 1 : Math.min(task.config.concurrency, task.config.maxAttempts - task.probeAttempts);
     const round: RoundState = { won: false, lanes: [] };
 
     task.status = 'requesting';
@@ -605,6 +605,7 @@ export class LiveTaskEngine {
       attempts: task.attemptsMade,
       elapsedMs: task.acceptedAt - task.startedAt,
       acceptedAt: task.acceptedAt,
+      showdocUrl: task.config.showdocPushUrl,
       chatId: task.config.telegramChatId.trim(),
       botToken: task.config.telegramBotToken.trim(),
       sendKey: task.config.serverchanSendKey,
@@ -902,15 +903,6 @@ function errorMessage(error: unknown): string {
 
 function isTransientHttpFailure(detail: string): boolean {
   return /HTTP (?:408|409|425|429|500|502|503|504|529)\b/.test(detail);
-}
-
-/** Lanes per round: the configured concurrency, clamped to the limits and to the attempts left. */
-function laneCountFor(config: TaskConfig, remaining: number): number {
-  const requested = Math.trunc(config.concurrency);
-  const capped = Number.isFinite(requested)
-    ? Math.min(LIMITS.concurrency.max, Math.max(LIMITS.concurrency.min, requested))
-    : 1;
-  return Math.max(1, Math.min(capped, remaining));
 }
 
 /** Marks the round won and stops every sibling lane without letting it report a failure. */

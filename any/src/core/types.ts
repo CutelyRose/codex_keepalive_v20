@@ -2,6 +2,7 @@ export type Channel = 'gpt' | 'claude';
 export type Scheduler = 'browser' | 'python';
 export type SchedulerChoice = Scheduler | 'both';
 export interface NotificationSettings {
+  showdocPushUrl?: string;
   telegramChatId: string;
   telegramBotToken: string;
   serverchanSendKey?: string;
@@ -96,6 +97,7 @@ export interface NotificationPayload {
   attempts: number;
   elapsedMs: number;
   acceptedAt: number;
+  showdocUrl?: string;
   chatId?: string;
   botToken?: string;
   sendKey?: string;

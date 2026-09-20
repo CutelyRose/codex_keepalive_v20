@@ -44,7 +44,7 @@ export function clampSetting(
 ): number {
   const limits = LIMITS[name];
   if (!Number.isFinite(input)) return limits.min;
-  return Math.min(limits.max, Math.max(limits.min, input));
+  return Math.min('max' in limits ? limits.max : Number.MAX_SAFE_INTEGER, Math.max(limits.min, input));
 }
 
 export function isAcceptedStatus(status: TaskStatus): boolean {

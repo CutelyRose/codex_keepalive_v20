@@ -8,6 +8,7 @@ export const DEFAULT_SETTINGS: Readonly<AppSettings> = Object.freeze({
   keepalive: true,
   keepaliveMinSeconds: 60,
   keepaliveMaxSeconds: 90,
+  showdocPushUrl: '',
   telegramChatId: '',
   telegramBotToken: '',
   serverchanSendKey: '',
@@ -15,10 +16,10 @@ export const DEFAULT_SETTINGS: Readonly<AppSettings> = Object.freeze({
 });
 
 export const LIMITS = Object.freeze({
-  attempts: { min: 1, max: 10_000 },
+  attempts: { min: 1 },
   intervalSeconds: { min: 0.5, max: 3_600 },
   timeoutSeconds: { min: 30, max: 600 },
-  concurrency: { min: 1, max: 16 },
+  concurrency: { min: 1 },
   keepaliveMinSeconds: { min: 0.5, max: 86_400 },
   keepaliveMaxSeconds: { min: 0.5, max: 86_400 },
 });

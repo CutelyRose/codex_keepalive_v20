@@ -66,10 +66,11 @@ curl -fsS http://127.0.0.1:8787/api/health
 
 健康接口无需登录，只返回 Node / Python 调度可用状态。页面、任务和配置使用管理密码认证。
 
-在设置或新建任务的「成功通知」中选择一种配置：
+在设置或新建任务的「成功通知」中先选择推送方式，再填写显示的参数；留空关闭通知：
 
-- **Server 酱**：填写 SendKey，支持 `SCT…`（Turbo）和 `sctp…`（Server 酱 3）；标签可填 `服务器报警|图片`，Telegram 凭据留空。
-- **Telegram**：填写 Chat ID 和 Bot Token，Server 酱 SendKey 留空。
+- **ShowDoc（默认）**：从 [ShowDoc 推送服务](https://push.showdoc.com.cn/)复制完整的 `https://push.showdoc.com.cn/server/api/push/<推送密钥>` URL。
+- **Server 酱**：填写 SendKey，支持 `SCT…`（Turbo）和 `sctp…`（Server 酱 3）；标签可填 `服务器报警|图片`。
+- **Telegram**：填写 Chat ID 和 Bot Token。
 
 浏览器、Python 两端共用通知队列。首次成功或故障恢复后通知，持续保活成功不重复推送，冷却 300 秒；临时失败最多投递 5 次，重启继续未完成通知。`sent` 表示通知平台接口已确认受理。
 

@@ -2,6 +2,13 @@ import { LIMITS, MODEL_ID_PATTERN } from './constants';
 import { normalizeApiBaseUrl } from './api-url';
 import type { NotificationSettings, TaskConfig } from './types';
 
+export function showdocEndpoint(pushUrl: string): string {
+  if (!/^https:\/\/push\.showdoc\.com\.cn\/server\/api\/push\/[A-Za-z0-9_-]+$/.test(pushUrl)) {
+    throw new Error('ShowDoc 推送 URL 无效，请复制推送服务提供的完整 HTTPS 地址');
+  }
+  return pushUrl;
+}
+
 export function serverchanEndpoint(sendKey: string): string {
   const match = /^sctp(\d+)t[A-Za-z0-9_-]+$/.exec(sendKey);
   if (match) return `https://${match[1]}.push.ft07.com/send/${sendKey}.send`;
@@ -10,24 +17,29 @@ export function serverchanEndpoint(sendKey: string): string {
 }
 
 export function notificationConfigured(config: NotificationSettings): boolean {
-  return Boolean(config.serverchanSendKey || config.telegramChatId && config.telegramBotToken);
+  return Boolean(config.showdocPushUrl || config.serverchanSendKey || config.telegramChatId && config.telegramBotToken);
 }
 
 export function validateNotificationSettings(input: NotificationSettings): NotificationSettings {
   const values = {
+    showdocPushUrl: input.showdocPushUrl ?? '',
     telegramChatId: input.telegramChatId, telegramBotToken: input.telegramBotToken,
     serverchanSendKey: input.serverchanSendKey ?? '', serverchanTags: input.serverchanTags ?? '',
   };
   for (const [field, value] of Object.entries(values)) {
-    if (typeof value !== 'string' || value.length > (field.endsWith('Tags') || field.endsWith('ChatId') ? 128 : 256)) {
+    const max = field === 'showdocPushUrl' ? 1024 : field.endsWith('Tags') || field.endsWith('ChatId') ? 128 : 256;
+    if (typeof value !== 'string' || value.length > max) {
       throw new Error('通知配置无效或超长');
     }
   }
   const config = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, value.trim()])) as Required<NotificationSettings>;
-  if (config.serverchanSendKey && (config.telegramChatId || config.telegramBotToken)) throw new Error('Telegram 与 Server 酱请选择一种，清空另一种的凭据');
+  if ([config.showdocPushUrl, config.serverchanSendKey, config.telegramChatId || config.telegramBotToken].filter(Boolean).length > 1) {
+    throw new Error('每个任务只能配置一种成功通知方式');
+  }
   if (Boolean(config.telegramChatId) !== Boolean(config.telegramBotToken)) throw new Error('Chat ID 和 Bot Token 需要一起填写');
   if (config.telegramBotToken && !/^\d+:[A-Za-z0-9_-]+$/.test(config.telegramBotToken)) throw new Error('Telegram Bot Token 格式无效');
   if (config.serverchanSendKey) serverchanEndpoint(config.serverchanSendKey);
+  if (config.showdocPushUrl) showdocEndpoint(config.showdocPushUrl);
   return config;
 }
 
@@ -45,8 +57,9 @@ export function validateTaskConfig(input: TaskConfig): TaskConfig {
   } as const;
   for (const [field, limit] of Object.entries(numbers)) {
     const value = input[field as keyof typeof numbers];
-    if (!Number.isFinite(value) || value < LIMITS[limit].min || value > LIMITS[limit].max ||
-        (['maxAttempts', 'concurrency'].includes(field) && !Number.isInteger(value))) {
+    const range = LIMITS[limit];
+    if (!Number.isFinite(value) || value < range.min || ('max' in range && value > range.max) ||
+        (['maxAttempts', 'concurrency'].includes(field) && !Number.isSafeInteger(value))) {
       throw new Error(`${field} 超出范围`);
     }
   }

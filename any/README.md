@@ -26,7 +26,7 @@ npm.cmd start
 ## 使用
 
 1. 添加 API Key 和服务地址，完成模型列表鉴权。顶部选择 Python 视图后，Key 管理通过 Python 鉴权；浏览器视图通过浏览器鉴权。
-2. 新建任务，选择 **浏览器调度 / Python 调度 / 双端同时调度**，填写模型、提示词、探活参数和通知配置。
+2. 新建任务，选择 **浏览器调度 / Python 调度 / 双端同时调度**，填写模型、提示词、探活参数；成功通知先选择方式，再填写对应参数，默认 **ShowDoc 推送**。
 3. 自动保活默认开启：成功后切换为 **60–90 秒**随机请求间隔；可自定义范围，上下限相等时使用固定间隔。关闭自动保活则首次成功后结束。
 4. 任务中心支持 **全部 / 浏览器 / Python** 筛选。切换只改变显示范围；支持单任务暂停、继续、立即请求、取消和删除，以及批量暂停、取消、删除。
 
@@ -43,7 +43,7 @@ npm.cmd start
 ## 调度规则
 
 - GPT 的 `response.created` / `response.in_progress`、Claude 的 `message_start` 为成功。
-- 探活每轮并发 1–16 个请求；首个成功者停止本轮其他请求，继续读取成功流。
+- 探活次数与并发数均填写正整数，不设 10000 次 / 16 线程的固定最大值；每轮按配置并发和剩余探活预算中的较小值发送，首个成功者停止本轮其他请求，继续读取成功流。
 - 保活每次只发一个请求，复用任务会话。失败后恢复探活，每次成功重置探活预算。
 - “每轮探活上限”限制首次成功或恢复成功之前的请求次数；累计请求和成功次数单独统计，持续保活不因累计次数达到该值而停止。
 - 无效 Key、模型错误和额度不足停止任务；临时错误按探活间隔和 `Retry-After` 重试。
@@ -54,11 +54,15 @@ npm.cmd start
 
 Key、浏览器任务、默认设置和主题保存在浏览器 localStorage。更换浏览器、主机名或端口会使用另一份浏览器数据。仅加载当前格式的任务，旧格式任务需重新创建。
 
-Python 任务保存独立连接快照。Windows 使用当前用户的 DPAPI 保护任务数据；Linux/macOS 使用权限受限的本地文件。状态接口不返回模型 Key、Bot Token 或 SendKey。
+Python 任务保存独立连接快照。Windows 使用当前用户的 DPAPI 保护任务数据；Linux/macOS 使用权限受限的本地文件。状态接口不返回模型 Key、ShowDoc 推送 URL、Bot Token 或 SendKey。
 
-两端共用 Node 通知队列 `data/notifications.sqlite`。Telegram 填写 Chat ID 和 Bot Token；Server 酱填写 SendKey，支持 SCT / sctp，可填写以 `|` 分隔的标签。每个任务选择一种通知方式，另一种的凭据留空。
+两端共用 Node 通知队列 `data/notifications.sqlite`。新建任务与默认设置均先选择推送方式，只显示并提交所选方式的参数；留空关闭通知：
 
-首次成功或失败后恢复成功时提交通知，默认冷却 300 秒。关闭页面后已提交的通知仍可投递，需要保持服务运行。临时错误最多重试 5 次，投递结束后清除队列记录中的 Bot Token、Chat ID 和 SendKey。
+- **ShowDoc（默认）**：从 [ShowDoc 推送服务](https://push.showdoc.com.cn/)复制完整的 `https://push.showdoc.com.cn/server/api/push/<推送密钥>` URL。
+- **Telegram**：填写 Chat ID 和 Bot Token。
+- **Server 酱**：填写 SendKey，支持 SCT / sctp，可填写以 `|` 分隔的标签。
+
+首次成功或失败后恢复成功时提交通知，默认冷却 300 秒。关闭页面后已提交的通知仍可投递，需要保持服务运行。临时错误最多重试 5 次，投递结束后清除队列记录中的 ShowDoc 推送 URL、Bot Token、Chat ID 和 SendKey。
 
 `data/`、`.local/`、`dist/` 和依赖目录均被 Git 忽略。
 
@@ -75,6 +79,6 @@ npm.cmd run check
 npm.cmd test
 ```
 
-测试使用本机模拟 API 和通知服务，覆盖请求协议、SSE、双端并行、保活恢复、暂停取消、Python 重启恢复、Telegram / Server 酱、访问认证及写入合并，不调用真实模型或发送真实通知。
+测试使用本机模拟 API 和通知服务，覆盖请求协议、SSE、超过 16 个请求的双端并发、保活恢复、暂停取消、Python 重启恢复、ShowDoc / Telegram / Server 酱、访问认证及写入合并，不调用真实模型或发送真实通知。
 
 接口与实现见 [TECHNICAL.md](TECHNICAL.md)。

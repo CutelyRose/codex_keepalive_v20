@@ -10,7 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { build } from 'esbuild';
 import { startServer } from '../server.mjs';
-import { serverchanEndpoint } from '../dist/task-requests.mjs';
+import { serverchanEndpoint, validateTaskConfig } from '../dist/task-requests.mjs';
 
 const directory = await mkdtemp(join(tmpdir(), 'anyrouter-check-'));
 after(async () => {
@@ -33,7 +33,7 @@ await build({
   outfile: bundlePath, bundle: true, platform: 'node', format: 'esm', logLevel: 'silent',
 });
 const { LiveTaskEngine, AnyRouterGateway, SseParser, readSseStream,
-  retryableModelError, retryAfterMilliseconds, saveTasks, loadTasks, AppStore, createClaudeRequestIdentity, createCodexRequestIdentity } = await import(pathToFileURL(bundlePath));
+  retryableModelError, retryAfterMilliseconds, saveTasks, loadTasks, saveSettings, loadSettings, AppStore, createClaudeRequestIdentity, createCodexRequestIdentity } = await import(pathToFileURL(bundlePath));
 
 async function until(check, message) {
   const deadline = Date.now() + 5000;
@@ -70,13 +70,32 @@ test('SSE byte boundaries, cancellation and retry classification', async () => {
   assert.equal(retryAfterMilliseconds('Fri, 18 Sep 2026 00:00:02 GMT', Date.parse('2026-09-18T00:00:00Z')), 2000);
 });
 
-test('browser engine sends direct GPT/Claude traffic, bounds concurrency and cancels losing streams', async t => {
+test('large probe and concurrency settings persist without fixed caps', () => {
+  const data = new Map();
+  const storage = { getItem: key => data.get(key) ?? null, setItem: (key, value) => data.set(key, value) };
+  const settings = { ...loadSettings(storage), attempts: 20001, concurrency: 128,
+    showdocPushUrl: 'https://push.showdoc.com.cn/server/api/push/showdoc-test-only' };
+  saveSettings(settings, storage);
+  assert.deepEqual(loadSettings(storage), settings);
+  const config = { ...settings, name: 'Large limits', channel: 'gpt', keyId: 'local',
+    baseUrl: 'http://127.0.0.1:1', model: 'gpt-test', prompt: 'Reply OK', maxAttempts: settings.attempts, oneMillion: false };
+  assert.equal(validateTaskConfig(config).maxAttempts, 20001);
+  assert.equal(validateTaskConfig(config).concurrency, 128);
+  for (const field of ['maxAttempts', 'concurrency']) {
+    for (const value of [0, -1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(() => validateTaskConfig({ ...config, [field]: value }));
+    }
+  }
+});
+
+test('browser engine sends direct GPT/Claude traffic, runs configured concurrency and cancels losing streams', async t => {
   t.mock.method(crypto, 'randomUUID', () => { throw new Error('randomUUID is unavailable over plain HTTP'); });
   const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
   assert.match(createClaudeRequestIdentity().sessionId, uuidPattern);
   assert.match(createCodexRequestIdentity().sessionId.replace(/^session_/, ''), uuidPattern);
   const requests = [], counts = new Map(), engines = [];
   let closedStreams = 0;
+  let finishParallel;
   const upstream = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -96,7 +115,9 @@ test('browser engine sends direct GPT/Claude traffic, bounds concurrency and can
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     if (body.model === 'gpt-hold' || body.model === 'gpt-parallel' && count > 1) {
       res.write('event: ping\ndata: {"type":"ping","source":"sibling"}\n\n');
-      res.on('close', () => { closedStreams += 1; }); return;
+      res.on('close', () => { closedStreams += 1; });
+      if (body.model === 'gpt-parallel' && count === 20) finishParallel();
+      return;
     }
     const send = () => {
       const event = req.url.startsWith('/v1/messages') ? 'message_start' : 'response.created';
@@ -104,7 +125,7 @@ test('browser engine sends direct GPT/Claude traffic, bounds concurrency and can
       if (body.model === 'gpt-interrupted') setTimeout(() => res.destroy(), 40);
       else res.end('data: [DONE]\n\n');
     };
-    if (body.model === 'gpt-parallel') setTimeout(send, 80);
+    if (body.model === 'gpt-parallel') finishParallel = send;
     else send();
   });
   await new Promise(resolveListen => upstream.listen(0, '127.0.0.1', resolveListen));
@@ -142,9 +163,9 @@ test('browser engine sends direct GPT/Claude traffic, bounds concurrency and can
   assert.match(message.headers['anthropic-beta'], /context-1m/);
   assert.equal(message.body.tools.length, 26);
 
-  const parallel = engine.create({ ...config, model: 'gpt-parallel', concurrency: 4, maxAttempts: 3 });
-  await until(() => parallel.status === 'accepted-completed' && closedStreams === 2, 'losing streams were not cancelled');
-  assert.equal(parallel.attemptsMade, 3);
+  const parallel = engine.create({ ...config, model: 'gpt-parallel', concurrency: 24, maxAttempts: 20 });
+  await until(() => parallel.status === 'accepted-completed' && closedStreams === 19, 'configured parallel requests did not finish and cancel losing streams');
+  assert.equal(parallel.attemptsMade, 20);
   assert.equal(parallel.events.filter(event => event.title === '已成功挤入').length, 1);
   assert.equal(parallel.responseSummary.includes('sibling'), false);
   const fatal = engine.create({ ...config, model: 'gpt-fatal', maxAttempts: 5 });
@@ -154,13 +175,13 @@ test('browser engine sends direct GPT/Claude traffic, bounds concurrency and can
   await until(() => interrupted.status === 'accepted-stream-interrupted', 'accepted stream interruption was lost');
   await delay(600);
   assert.equal(interrupted.attemptsMade, 1);
-  assert.equal(counts.get('gpt-parallel'), 3);
+  assert.equal(counts.get('gpt-parallel'), 20);
   assert.equal(counts.get('gpt-fatal'), 1);
 
   const held = engine.create({ ...config, model: 'gpt-hold' });
   await until(() => counts.has('gpt-hold'), 'hold request did not start');
   assert.equal(engine.pause(held.id), true);
-  await until(() => closedStreams === 3, 'pause did not abort direct stream');
+  await until(() => closedStreams === 20, 'pause did not abort direct stream');
   assert.equal(engine.resume(held.id), true);
   await until(() => counts.get('gpt-hold') === 2, 'resume did not start a new request');
   const data = new Map();
@@ -169,12 +190,12 @@ test('browser engine sends direct GPT/Claude traffic, bounds concurrency and can
   const restored = new LiveTaskEngine({ getKey: () => 'sk-frontend-test-only' });
   engines.push(restored); restored.restore(loadTasks(storage));
   assert.equal(restored.get(held.id).status, 'paused');
-  assert.equal(restored.get(parallel.id).config.concurrency, 4);
+  assert.equal(restored.get(parallel.id).config.concurrency, 24);
   assert.equal(restored.get(parallel.id).sessionId, parallel.sessionId);
   assert.equal(restored.get(parallel.id).successes, 1);
   assert.equal(restored.get(parallel.id).probeAttempts, 0);
   assert.equal(engine.remove(held.id), true);
-  await until(() => closedStreams === 4, 'deleting a task did not abort its stream');
+  await until(() => closedStreams === 21, 'deleting a task did not abort its stream');
   assert.equal(engine.get(held.id), undefined);
 });
 
@@ -248,6 +269,7 @@ test('local server hosts both schedulers and durable notification delivery', asy
 test('browser and Python run together, recover keepalive and preserve backend ownership', async t => {
   const seen = new Map(), requests = [];
   let closedLosers = 0;
+  let finishParallel;
   const upstream = createServer(async (req, res) => {
     assert.equal(req.headers.authorization, 'Bearer sk-dual-test-only');
     res.setHeader('Content-Type', 'application/json');
@@ -265,14 +287,16 @@ test('browser and Python run together, recover keepalive and preserve backend ow
     res.setHeader('Content-Type', 'text/event-stream');
     if (body.model === 'gpt-parallel' && count > 1 || body.model === 'gpt-held') {
       res.write('event: ping\ndata: {"type":"ping"}\n\n');
-      res.on('close', () => { closedLosers++; }); return;
+      res.on('close', () => { closedLosers++; });
+      if (body.model === 'gpt-parallel' && count === 20) finishParallel();
+      return;
     }
     const finish = () => {
       const type = body.model.startsWith('claude') ? 'message_start' : 'response.created';
       res.write(`event: ${type}\ndata: {"type":"${type}"}\n\n`);
       res.end('data: [DONE]\n\n');
     };
-    if (body.model === 'gpt-parallel') setTimeout(finish, 150);
+    if (body.model === 'gpt-parallel') finishParallel = finish;
     else finish();
   });
   await new Promise(resolveListen => upstream.listen(0, '127.0.0.1', resolveListen));
@@ -338,11 +362,11 @@ test('browser and Python run together, recover keepalive and preserve backend ow
   await until(() => seen.get('gpt-python') > stoppedCount, 'active task did not recover after service restart');
   await call(`tasks/${remote.id}/cancel`, 'POST');
 
-  const parallel = await call('tasks', 'POST', { config: { ...config, model: 'gpt-parallel', keepalive: false, concurrency: 4, maxAttempts: 3 }, token: 'sk-dual-test-only' });
+  const parallel = await call('tasks', 'POST', { config: { ...config, model: 'gpt-parallel', keepalive: false, concurrency: 24, maxAttempts: 20 }, token: 'sk-dual-test-only' });
   const completed = await until(async () => (await call('tasks')).find(task => task.id === parallel.id && task.status === 'accepted-completed'), 'Python parallel round did not finish');
-  assert.equal(completed.attemptsMade, 3);
+  assert.equal(completed.attemptsMade, 20);
   assert.equal(completed.successes, 1);
-  assert.equal(closedLosers, 2);
+  assert.equal(closedLosers, 19);
   const claude = await call('tasks', 'POST', { config: { ...config, channel: 'claude', model: 'claude-python[1m]', keepalive: false }, token: 'sk-dual-test-only' });
   await until(async () => (await call('tasks')).some(task => task.id === claude.id && task.status === 'accepted-completed'), 'Python Claude did not complete');
   const claudeRequest = requests.find(item => item.body.model === 'claude-python');
@@ -354,7 +378,7 @@ test('browser and Python run together, recover keepalive and preserve backend ow
   const held = await call('tasks', 'POST', { config: { ...config, model: 'gpt-held' }, token: 'sk-dual-test-only' });
   await until(() => seen.has('gpt-held'), 'Python held stream did not start');
   await call(`tasks/${held.id}`, 'DELETE');
-  await until(() => closedLosers === 3, 'Python delete did not stop the held stream');
+  await until(() => closedLosers === 20, 'Python delete did not stop the held stream');
   assert.equal((await call('tasks')).some(task => task.id === held.id), false);
   const invalid = await fetch(`${app.url}/api/python/tasks`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ config: { ...config, keepaliveMinSeconds: 20, keepaliveMaxSeconds: 10 }, token: 'sk-dual-test-only' }) });
@@ -552,6 +576,94 @@ test('protected deployment delivers ServerChan from both schedulers and restores
   const db = new DatabaseSync(options.dbPath, { readOnly: true });
   try {
     assert.ok(db.prepare('SELECT payload FROM notifications').all().every(row => !row.payload.includes(config.serverchanSendKey)));
+  } finally { db.close(); }
+});
+
+test('ShowDoc delivers from both schedulers, restores retries and protects push credentials', async t => {
+  const messages = [], counts = new Map();
+  const showdocUrl = 'https://push.showdoc.com.cn/server/api/push/showdoc-test-only';
+  const upstream = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    if (req.url === '/v1/responses') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.end('data: {"type":"response.created"}\n\ndata: [DONE]\n\n');
+      return;
+    }
+    assert.equal(req.url, '/server/api/push/showdoc-test-only');
+    assert.match(req.headers['content-type'], /^application\/x-www-form-urlencoded/);
+    const body = Object.fromEntries(new URLSearchParams(Buffer.concat(chunks).toString('utf8')));
+    assert.deepEqual(Object.keys(body).sort(), ['content', 'title']);
+    messages.push(body);
+    const count = (counts.get(body.title) ?? 0) + 1;
+    counts.set(body.title, count);
+    res.setHeader('Content-Type', 'application/json');
+    if (body.title.includes('Permanent')) {
+      res.end(JSON.stringify({ error_code: 10107, error_message: `Rejected ${showdocUrl} showdoc-test-only` }));
+    } else if (body.title.includes('Retry') && count === 1) {
+      res.writeHead(429, { 'Retry-After': '1' });
+      res.end('{"error_code":429,"error_message":"busy"}');
+    } else res.end('{"error_code":0,"data":{}}');
+  });
+  await new Promise(resolveListen => upstream.listen(0, '127.0.0.1', resolveListen));
+  const baseUrl = `http://127.0.0.1:${upstream.address().port}`;
+  let clock = Date.now();
+  const options = { port: 0, dbPath: join(directory, 'showdoc', 'notifications.sqlite'),
+    now: () => clock, showdocBaseUrl: baseUrl };
+  let app = await startServer(options);
+  const post = (path, body) => fetch(app.url + path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const receipt = async id => (await fetch(`${app.url}/api/notifications/${id}`)).json();
+  const tasks = async () => (await fetch(app.url + '/api/python/tasks')).json();
+  const browser = new LiveTaskEngine({ getKey: () => 'sk-showdoc-test-only', notificationPollMs: 10,
+    notificationClient: { enqueue: async payload => (await post('/api/notifications', payload)).json(), get: receipt } });
+  t.after(async () => {
+    browser.dispose(); await app.close(); upstream.closeAllConnections();
+    await new Promise(resolveClose => upstream.close(resolveClose));
+  });
+  const config = { name: 'Browser ShowDoc', channel: 'gpt', keyId: 'local', baseUrl, model: 'gpt-notice', prompt: 'Reply OK',
+    maxAttempts: 20001, concurrency: 1, intervalSeconds: .5, timeoutSeconds: 30, keepalive: false,
+    keepaliveMinSeconds: 60, keepaliveMaxSeconds: 90, telegramChatId: '', telegramBotToken: '',
+    showdocPushUrl: showdocUrl, oneMillion: false };
+  const local = browser.create(config);
+  const created = await post('/api/python/tasks', { config: { ...config, name: 'Python ShowDoc' }, token: 'sk-showdoc-test-only' });
+  assert.equal(created.status, 201);
+  const remote = await created.json();
+  assert.equal(remote.config.showdocPushUrl, '');
+  assert.equal(remote.notificationConfigured, true);
+  await until(() => local.notificationStatus === 'sent', 'browser did not send ShowDoc');
+  await until(async () => (await tasks()).some(task => task.id === remote.id && task.notificationStatus === 'sent'), 'Python did not send ShowDoc');
+  assert.equal(messages.length, 2);
+  assert.ok(messages.every(message => message.title.startsWith('任务已接入：') && message.content.includes('Key 尾号：only')));
+  assert.equal(JSON.stringify(messages).includes(showdocUrl), false);
+  const payload = { taskId: 'showdoc-retry', taskName: 'Retry restart', channel: 'gpt', model: 'gpt-notice', keyTail: 'test',
+    attempts: 1, elapsedMs: 1, acceptedAt: clock, showdocUrl };
+  for (const invalid of ['http://push.showdoc.com.cn/server/api/push/test',
+    'https://other.example/server/api/push/test', `${showdocUrl}?redirect=1`]) {
+    assert.equal((await post('/api/notifications', { ...payload, showdocUrl: invalid })).status, 400);
+  }
+  assert.equal((await post('/api/notifications', { ...payload, sendKey: 'SCTtest' })).status, 400);
+  const permanent = await (await post('/api/notifications', { ...payload, taskId: 'showdoc-dead', taskName: 'Permanent' })).json();
+  const dead = await until(async () => { const value = await receipt(permanent.id); return value.status === 'dead' && value; }, 'ShowDoc business error did not stop');
+  assert.equal(dead.attempts, 1);
+  assert.equal(dead.error.includes('showdoc-test-only'), false);
+  const pending = await (await post('/api/notifications', payload)).json();
+  const retrying = await until(async () => { const value = await receipt(pending.id); return value.status === 'retrying' && value; }, 'ShowDoc HTTP 429 did not retry');
+  assert.equal(retrying.nextAttemptAt, clock + 1000);
+  await app.close(); clock += 1000; app = await startServer(options);
+  await until(async () => (await receipt(pending.id)).status === 'sent', 'ShowDoc retry did not survive restart');
+  assert.equal((await (await post('/api/notifications', payload)).json()).id, pending.id);
+  assert.equal(counts.get('任务已接入：Retry restart'), 2);
+  clock = Date.now();
+  const restarted = await post(`/api/python/tasks/${remote.id}/restart`);
+  assert.equal(restarted.status, 201);
+  const again = await restarted.json();
+  assert.equal(again.config.showdocPushUrl, '');
+  await until(async () => (await tasks()).some(task => task.id === again.id && task.notificationStatus === 'sent'), 'restarted Python task lost ShowDoc credentials');
+  const db = new DatabaseSync(options.dbPath, { readOnly: true });
+  try {
+    assert.ok(db.prepare('SELECT payload FROM notifications').all().every(row => !row.payload.includes('showdoc-test-only')));
   } finally { db.close(); }
 });
 

@@ -33,15 +33,16 @@ function notificationPayload(input) {
   let config;
   try {
     config = validateNotificationSettings({ telegramChatId: input.chatId ?? '', telegramBotToken: input.botToken ?? '',
-      serverchanSendKey: input.sendKey, serverchanTags: input.tags });
+      serverchanSendKey: input.sendKey, serverchanTags: input.tags, showdocPushUrl: input.showdocUrl });
   } catch (error) { throw problem(400, error.message); }
-  if (!notificationConfigured(config)) throw problem(400, '请填写 Telegram 或 Server 酱通知凭据');
+  if (!notificationConfigured(config)) throw problem(400, '请填写所选通知方式的推送参数');
   return {
     taskId: textField(input.taskId, '任务 ID', 200), taskName: textField(input.taskName, '任务名称', 100),
     channel: input.channel, model, keyTail: textField(input.keyTail, 'Key 尾号', 4),
     attempts: numberField(input.attempts, '尝试次数'), elapsedMs: numberField(input.elapsedMs, '耗时'),
     acceptedAt: numberField(input.acceptedAt, '成功时间'),
-    ...(config.serverchanSendKey ? { sendKey: config.serverchanSendKey, tags: config.serverchanTags } :
+    ...(config.showdocPushUrl ? { showdocUrl: config.showdocPushUrl } :
+      config.serverchanSendKey ? { sendKey: config.serverchanSendKey, tags: config.serverchanTags } :
       { chatId: config.telegramChatId, botToken: config.telegramBotToken }),
   };
 }
@@ -50,6 +51,7 @@ function safeError(error, ...secrets) {
   let message = error instanceof Error ? error.message : String(error);
   for (const secret of secrets) if (secret) message = message.replaceAll(secret, '[redacted]');
   return message.replace(/sk-[A-Za-z0-9._-]+/g, '[redacted]')
+    .replace(/https:\/\/push\.showdoc\.com\.cn\/server\/api\/push\/[A-Za-z0-9_-]+/g, '[redacted]')
     .replace(/\b(?:SCT[A-Za-z0-9_-]+|sctp\d+t[A-Za-z0-9_-]+)/g, '[redacted]')
     .replace(/\b\d{6,}:[A-Za-z0-9_-]+/g, '[redacted]').slice(0, 500);
 }
@@ -86,7 +88,7 @@ function reply(response, status, value) {
 export async function startServer({
   port = 8787, dbPath = join(ROOT, 'data', 'notifications.sqlite'),
   host = '127.0.0.1', origin = '', password = '',
-  now = Date.now, telegramBaseUrl = 'https://api.telegram.org', serverchanBaseUrl,
+  now = Date.now, telegramBaseUrl = 'https://api.telegram.org', serverchanBaseUrl, showdocBaseUrl,
 } = {}) {
   if (origin) {
     const url = new URL(origin);
@@ -172,24 +174,27 @@ export async function startServer({
         `Key 尾号：${payload.keyTail}`, `尝试：${payload.attempts} 次`,
         `耗时：${Math.round(payload.elapsedMs / 1000)} 秒`,
       ].join('\n');
-      const serverchan = Boolean(payload.sendKey);
-      const provider = serverchan ? 'Server 酱' : 'Telegram';
-      const endpoint = serverchan ? (serverchanBaseUrl ? `${serverchanBaseUrl}/${payload.sendKey}.send` : serverchanEndpoint(payload.sendKey))
+      const showdoc = Boolean(payload.showdocUrl), serverchan = Boolean(payload.sendKey);
+      const provider = showdoc ? 'ShowDoc' : serverchan ? 'Server 酱' : 'Telegram';
+      const endpoint = showdoc ? (showdocBaseUrl ? `${showdocBaseUrl}${new URL(payload.showdocUrl).pathname}` : payload.showdocUrl)
+        : serverchan ? (serverchanBaseUrl ? `${serverchanBaseUrl}/${payload.sendKey}.send` : serverchanEndpoint(payload.sendKey))
         : `${telegramBaseUrl}/bot${payload.botToken}/sendMessage`;
       const response = await fetch(endpoint, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(serverchan ? { title: [...`任务已接入：${payload.taskName}`].slice(0, 32).join(''),
-          desp: text.split('\n').join('\n\n'), tags: payload.tags } : { chat_id: payload.chatId, text }), redirect: 'error',
+        method: 'POST', headers: { 'Content-Type': showdoc ? 'application/x-www-form-urlencoded;charset=UTF-8' : 'application/json' },
+        body: showdoc ? new URLSearchParams({ title: `任务已接入：${payload.taskName}`, content: text }).toString()
+          : JSON.stringify(serverchan ? { title: [...`任务已接入：${payload.taskName}`].slice(0, 32).join(''),
+            desp: text.split('\n').join('\n\n'), tags: payload.tags } : { chat_id: payload.chatId, text }), redirect: 'error',
         signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]),
       });
       let result;
       try { result = await response.json(); }
       catch { throw Object.assign(new Error(`${provider} HTTP ${response.status} 返回无效 JSON`), { retryable: RETRYABLE_HTTP.has(response.status) }); }
-      const accepted = serverchan ? result.code === 0 && (result.data?.errno === undefined || result.data.errno === 0) : result.ok === true;
+      const accepted = showdoc ? result.error_code === 0
+        : serverchan ? result.code === 0 && (result.data?.errno === undefined || result.data.errno === 0) : result.ok === true;
       if (!response.ok || !accepted) {
-        const status = serverchan ? response.status : result.error_code ?? response.status;
-        throw Object.assign(new Error((serverchan ? result.message || result.data?.error : result.description) || `${provider} HTTP ${status}`), {
-          retryable: RETRYABLE_HTTP.has(status), retryAfter: serverchan ? Number(response.headers.get('Retry-After')) : result.parameters?.retry_after,
+        const status = showdoc || serverchan ? response.status : result.error_code ?? response.status;
+        throw Object.assign(new Error((showdoc ? result.error_message : serverchan ? result.message || result.data?.error : result.description) || `${provider} HTTP ${status}`), {
+          retryable: RETRYABLE_HTTP.has(status), retryAfter: showdoc || serverchan ? Number(response.headers.get('Retry-After')) : result.parameters?.retry_after,
         });
       }
       if (closing || controller.signal.aborted) return;
@@ -197,7 +202,7 @@ export async function startServer({
       record.error = undefined;
     } catch (error) {
       if (closing || controller.signal.aborted) return;
-      record.error = safeError(error, payload.botToken, payload.chatId, payload.sendKey);
+      record.error = safeError(error, payload.botToken, payload.chatId, payload.sendKey, payload.showdocUrl, payload.showdocUrl?.split('/').at(-1));
       record.status = error.retryable !== false && record.attempts < 5 ? 'retrying' : 'dead';
       const delay = Number.isFinite(error.retryAfter) && error.retryAfter > 0
         ? error.retryAfter * 1000 : 2000 * 2 ** (record.attempts - 1);
@@ -207,6 +212,7 @@ export async function startServer({
       delete record.payload.botToken;
       delete record.payload.chatId;
       delete record.payload.sendKey;
+      delete record.payload.showdocUrl;
       delete record.nextAttemptAt;
     }
     saveNotice(record);

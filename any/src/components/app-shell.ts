@@ -33,8 +33,10 @@ import {
 } from '../core/utils';
 
 type Page = 'overview' | 'keys' | 'create' | 'tasks' | 'settings';
+type NotificationProvider = 'showdoc' | 'serverchan' | 'telegram';
 
 interface TaskDraft extends NotificationSettings {
+  notificationProvider: NotificationProvider;
   scheduler: SchedulerChoice;
   name: string;
   channel: Channel;
@@ -412,7 +414,7 @@ export class AppShell extends HTMLElement {
         <span class="protocol-divider"></span>
         <div class="protocol-item"><span class="channel-logo claude-logo">C</span><div><strong>Claude Code Messages</strong><span><code>message_start</code> 为成功</span></div></div>
         <span class="protocol-divider"></span>
-        <div class="protocol-item"><span class="channel-logo local-logo">N</span><div><strong>Telegram / Server 酱</strong><span>成功后发送任务摘要</span></div></div>
+        <div class="protocol-item"><span class="channel-logo local-logo">N</span><div><strong>成功通知</strong><span>ShowDoc、Telegram、Server 酱</span></div></div>
       </section>
     `;
   }
@@ -524,8 +526,8 @@ export class AppShell extends HTMLElement {
             <label class="field"><span>任务名称</span><input name="name" value="${escapeHtml(this.taskDraft.name)}" maxlength="60" required /></label>
             <label class="field"><span>探针提示词</span><textarea name="prompt" rows="3" maxlength="1000" required>${escapeHtml(this.taskDraft.prompt)}</textarea><small>默认只要求返回 OK，以降低探针开销。</small></label>
             <div class="field-grid two-cols">
-              ${numberField('maxAttempts', '每轮探活上限', this.taskDraft.maxAttempts, LIMITS.attempts.min, LIMITS.attempts.max, 1, '次')}
-              ${numberField('concurrency', '并发线程', this.taskDraft.concurrency, LIMITS.concurrency.min, LIMITS.concurrency.max, 1, '线程')}
+              ${numberField('maxAttempts', '每轮探活上限', this.taskDraft.maxAttempts, LIMITS.attempts.min, undefined, 1, '次')}
+              ${numberField('concurrency', '并发线程', this.taskDraft.concurrency, LIMITS.concurrency.min, undefined, 1, '线程')}
               ${numberField('intervalSeconds', '请求间隔', this.taskDraft.intervalSeconds, LIMITS.intervalSeconds.min, LIMITS.intervalSeconds.max, 0.5, '秒')}
               ${numberField('timeoutSeconds', '首事件超时', this.taskDraft.timeoutSeconds, LIMITS.timeoutSeconds.min, LIMITS.timeoutSeconds.max, 1, '秒')}
             </div>
@@ -539,7 +541,7 @@ export class AppShell extends HTMLElement {
 
           <section class="surface form-section" aria-labelledby="notify-heading">
             <div class="form-section-head"><span class="step-number">04</span><div><h2 id="notify-heading">成功通知</h2><p>首次成功或故障恢复后发送任务摘要。</p></div></div>
-            ${this.notificationFields(this.taskDraft)}
+            ${this.notificationFields(this.taskDraft, this.taskDraft.notificationProvider)}
           </section>
         </div>
         <aside class="surface launch-panel">
@@ -651,12 +653,31 @@ export class AppShell extends HTMLElement {
     this.updateCountdowns();
   }
 
-  private notificationFields(config: NotificationSettings): string {
-    return `<p class="field-help">Telegram 与 Server 酱任选一种；全部留空关闭通知。发送任务名、模型、Key 尾号、尝试次数和耗时。</p>
-      <label class="field"><span>Telegram Chat ID <small class="optional">可选</small></span><input name="telegramChatId" value="${escapeHtml(config.telegramChatId)}" maxlength="128" placeholder="-1001234567890" /></label>
-      <label class="field"><span>Telegram Bot Token <small class="optional">可选</small></span><input name="telegramBotToken" type="password" value="${escapeHtml(config.telegramBotToken)}" maxlength="256" autocomplete="off" placeholder="123456:ABC..." /></label>
-      <label class="field"><span>Server 酱 SendKey <small class="optional">可选</small></span><input name="serverchanSendKey" type="password" value="${escapeHtml(config.serverchanSendKey ?? '')}" maxlength="256" autocomplete="off" placeholder="SCT… 或 sctp…" /><small>填写 SendKey 即可启用 Server 酱，支持 Turbo 和 Server 酱 3。</small></label>
-      <label class="field"><span>Server 酱标签 <small class="optional">可选</small></span><input name="serverchanTags" value="${escapeHtml(config.serverchanTags ?? '')}" maxlength="128" placeholder="服务器报警|图片" /><small>多个标签用 | 分隔。</small></label>`;
+  private notificationProvider(config: NotificationSettings): NotificationProvider {
+    return config.showdocPushUrl ? 'showdoc' : config.serverchanSendKey ? 'serverchan'
+      : config.telegramChatId || config.telegramBotToken ? 'telegram' : 'showdoc';
+  }
+
+  private notificationFields(config: NotificationSettings, provider = this.notificationProvider(config)): string {
+    return `<div class="notification-fields">
+      <p class="field-help">选择推送方式，再填写对应参数；参数留空则关闭通知。发送任务名、模型、Key 尾号、尝试次数和耗时。</p>
+      <label class="field"><span>推送方式</span><select name="notificationProvider">
+        <option value="showdoc" ${provider === 'showdoc' ? 'selected' : ''}>ShowDoc 推送</option>
+        <option value="serverchan" ${provider === 'serverchan' ? 'selected' : ''}>Server 酱</option>
+        <option value="telegram" ${provider === 'telegram' ? 'selected' : ''}>Telegram</option>
+      </select></label>
+      <div data-notification-provider="showdoc" ${provider !== 'showdoc' ? 'hidden' : ''}>
+        <label class="field"><span>ShowDoc 推送 URL <small class="optional">可选</small></span><input name="showdocPushUrl" type="password" value="${escapeHtml(config.showdocPushUrl ?? '')}" maxlength="1024" autocomplete="off" placeholder="https://push.showdoc.com.cn/server/api/push/…" ${provider !== 'showdoc' ? 'disabled' : ''} /><small>从 <a href="https://push.showdoc.com.cn/" target="_blank" rel="noopener noreferrer">ShowDoc 推送服务</a>复制完整推送 URL。</small></label>
+      </div>
+      <div data-notification-provider="serverchan" ${provider !== 'serverchan' ? 'hidden' : ''}>
+        <label class="field"><span>Server 酱 SendKey <small class="optional">可选</small></span><input name="serverchanSendKey" type="password" value="${escapeHtml(config.serverchanSendKey ?? '')}" maxlength="256" autocomplete="off" placeholder="SCT… 或 sctp…" ${provider !== 'serverchan' ? 'disabled' : ''} /><small>支持 Turbo 和 Server 酱 3。</small></label>
+        <label class="field"><span>Server 酱标签 <small class="optional">可选</small></span><input name="serverchanTags" value="${escapeHtml(config.serverchanTags ?? '')}" maxlength="128" placeholder="服务器报警|图片" ${provider !== 'serverchan' ? 'disabled' : ''} /><small>多个标签用 | 分隔。</small></label>
+      </div>
+      <div data-notification-provider="telegram" ${provider !== 'telegram' ? 'hidden' : ''}>
+        <label class="field"><span>Telegram Chat ID <small class="optional">可选</small></span><input name="telegramChatId" value="${escapeHtml(config.telegramChatId)}" maxlength="128" placeholder="-1001234567890" ${provider !== 'telegram' ? 'disabled' : ''} /></label>
+        <label class="field"><span>Telegram Bot Token <small class="optional">可选</small></span><input name="telegramBotToken" type="password" value="${escapeHtml(config.telegramBotToken)}" maxlength="256" autocomplete="off" placeholder="123456:ABC..." ${provider !== 'telegram' ? 'disabled' : ''} /></label>
+      </div>
+    </div>`;
   }
 
   private settingsMarkup(): string {
@@ -667,8 +688,8 @@ export class AppShell extends HTMLElement {
           <div class="section-head"><div><span class="section-kicker">任务默认值</span><h2>重试参数</h2></div><span class="settings-icon" aria-hidden="true">${icon('sliders')}</span></div>
           <p class="section-description">只影响后续新建任务；已运行任务保持原配置。</p>
           <div class="field-grid two-cols settings-numbers">
-            ${numberField('attempts', '默认请求次数', settings.attempts, LIMITS.attempts.min, LIMITS.attempts.max, 1, '次')}
-            ${numberField('concurrency', '默认并发线程', settings.concurrency, LIMITS.concurrency.min, LIMITS.concurrency.max, 1, '线程')}
+            ${numberField('attempts', '默认请求次数', settings.attempts, LIMITS.attempts.min, undefined, 1, '次')}
+            ${numberField('concurrency', '默认并发线程', settings.concurrency, LIMITS.concurrency.min, undefined, 1, '线程')}
             ${numberField('intervalSeconds', '默认请求间隔', settings.intervalSeconds, LIMITS.intervalSeconds.min, LIMITS.intervalSeconds.max, 0.5, '秒')}
             ${numberField('timeoutSeconds', '默认首事件超时', settings.timeoutSeconds, LIMITS.timeoutSeconds.min, LIMITS.timeoutSeconds.max, 1, '秒')}
             ${numberField('keepaliveMinSeconds', '保活最短间隔', settings.keepaliveMinSeconds, LIMITS.keepaliveMinSeconds.min, LIMITS.keepaliveMinSeconds.max, 0.5, '秒')}
@@ -683,7 +704,7 @@ export class AppShell extends HTMLElement {
             ${this.themeToggleMarkup()}
           </div>
           <hr />
-          <div class="section-head"><div><span class="section-kicker">通知默认值</span><h2>Telegram / Server 酱</h2></div><span class="settings-icon" aria-hidden="true">${icon('send')}</span></div>
+          <div class="section-head"><div><span class="section-kicker">通知默认值</span><h2>成功通知</h2></div><span class="settings-icon" aria-hidden="true">${icon('send')}</span></div>
           ${this.notificationFields(settings)}
           <div class="form-actions"><button class="button secondary" type="button" data-action="reset-settings">恢复默认</button><button class="button primary" type="submit">${icon('check')} 保存设置</button></div>
         </form>
@@ -694,7 +715,7 @@ export class AppShell extends HTMLElement {
             <p>管理凭据、模型列表、任务记录和默认设置。</p>
             <ul><li>${icon('check')} 多 Key 与模型列表</li><li>${icon('check')} 任务记录与响应摘要</li><li>${icon('check')} 通知默认值</li></ul>
           </section>
-          <section class="surface gate-card"><span class="section-kicker">服务功能</span><h2>请求通道</h2><p>支持 GPT Responses、Claude Code Messages，以及 Telegram / Server 酱通知。</p><ar-status-pill label="双端调度 · 成功通知" tone="green" dot></ar-status-pill></section>
+          <section class="surface gate-card"><span class="section-kicker">服务功能</span><h2>请求通道</h2><p>支持 GPT Responses、Claude Code Messages，以及 ShowDoc、Telegram、Server 酱通知。</p><ar-status-pill label="双端调度 · 成功通知" tone="green" dot></ar-status-pill></section>
         </aside>
       </div>
     `;
@@ -930,6 +951,7 @@ export class AppShell extends HTMLElement {
       keepaliveMaxSeconds: Number(data.get('keepaliveMaxSeconds')),
       telegramChatId: String(data.get('telegramChatId') ?? '').trim(),
       telegramBotToken: String(data.get('telegramBotToken') ?? '').trim(),
+      showdocPushUrl: String(data.get('showdocPushUrl') ?? '').trim(),
       serverchanSendKey: String(data.get('serverchanSendKey') ?? '').trim(),
       serverchanTags: String(data.get('serverchanTags') ?? '').trim(),
       oneMillion,
@@ -985,6 +1007,7 @@ export class AppShell extends HTMLElement {
       keepaliveMaxSeconds: Number(data.get('keepaliveMaxSeconds')),
       telegramChatId: String(data.get('telegramChatId') ?? '').trim(),
       telegramBotToken: String(data.get('telegramBotToken') ?? '').trim(),
+      showdocPushUrl: String(data.get('showdocPushUrl') ?? '').trim(),
       serverchanSendKey: String(data.get('serverchanSendKey') ?? '').trim(),
       serverchanTags: String(data.get('serverchanTags') ?? '').trim(),
     };
@@ -1115,6 +1138,15 @@ export class AppShell extends HTMLElement {
 
   private handleChange(event: Event): void {
     const target = event.target as HTMLInputElement | HTMLSelectElement;
+    if (target.name === 'notificationProvider') {
+      const section = target.closest('.notification-fields')!;
+      for (const fields of section.querySelectorAll<HTMLElement>('[data-notification-provider]')) {
+        fields.hidden = fields.dataset.notificationProvider !== target.value;
+        for (const input of fields.querySelectorAll<HTMLInputElement>('input')) input.disabled = fields.hidden;
+      }
+      if (target.closest('#task-form')) this.captureDraft();
+      return;
+    }
     if (target.dataset.action === 'select-task') {
       const checkbox = target as HTMLInputElement;
       if (checkbox.checked) this.selectedTaskIds.add(target.dataset.taskId ?? '');
@@ -1198,6 +1230,7 @@ export class AppShell extends HTMLElement {
     if (!form) return;
     const data = new FormData(form);
     this.taskDraft = {
+      notificationProvider: String(data.get('notificationProvider')) as NotificationProvider,
       scheduler: String(data.get('scheduler') ?? this.taskDraft.scheduler) as SchedulerChoice,
       name: String(data.get('name') ?? this.taskDraft.name),
       channel: String(data.get('channel') ?? this.taskDraft.channel) as Channel,
@@ -1214,6 +1247,7 @@ export class AppShell extends HTMLElement {
       keepaliveMaxSeconds: Number(data.get('keepaliveMaxSeconds') ?? this.taskDraft.keepaliveMaxSeconds),
       telegramChatId: String(data.get('telegramChatId') ?? this.taskDraft.telegramChatId),
       telegramBotToken: String(data.get('telegramBotToken') ?? this.taskDraft.telegramBotToken),
+      showdocPushUrl: String(data.get('showdocPushUrl') ?? this.taskDraft.showdocPushUrl ?? ''),
       serverchanSendKey: String(data.get('serverchanSendKey') ?? this.taskDraft.serverchanSendKey ?? ''),
       serverchanTags: String(data.get('serverchanTags') ?? this.taskDraft.serverchanTags ?? ''),
       oneMillion: form.elements.namedItem('oneMillion')
@@ -1244,6 +1278,7 @@ export class AppShell extends HTMLElement {
     const models = readyKey ? modelsForChannel(readyKey.models, channel) : [];
     return {
       scheduler: this.schedulerFilter === 'all' ? this.taskDraft?.scheduler ?? 'browser' : this.schedulerFilter,
+      notificationProvider: this.notificationProvider(this.store.settings),
       name: `GPT 队列探针 ${new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date())}`,
       channel,
       keyId: readyKey?.id ?? '',
@@ -1259,6 +1294,7 @@ export class AppShell extends HTMLElement {
       keepaliveMaxSeconds: this.store.settings.keepaliveMaxSeconds,
       telegramChatId: this.store.settings.telegramChatId,
       telegramBotToken: this.store.settings.telegramBotToken,
+      showdocPushUrl: this.store.settings.showdocPushUrl,
       serverchanSendKey: this.store.settings.serverchanSendKey,
       serverchanTags: this.store.settings.serverchanTags,
       oneMillion: true,
@@ -1467,11 +1503,11 @@ function numberField(
   label: string,
   value: number,
   min: number,
-  max: number,
+  max: number | undefined,
   step: number,
   unit: string,
 ): string {
-  return `<label class="field"><span>${escapeHtml(label)}</span><span class="input-unit"><input type="number" name="${escapeHtml(name)}" value="${value}" min="${min}" max="${max}" step="${step}" required /><i>${escapeHtml(unit)}</i></span><small>范围 ${min.toLocaleString()}–${max.toLocaleString()}</small></label>`;
+  return `<label class="field"><span>${escapeHtml(label)}</span><span class="input-unit"><input type="number" name="${escapeHtml(name)}" value="${value}" min="${min}" ${max === undefined ? '' : `max="${max}"`} step="${step}" required /><i>${escapeHtml(unit)}</i></span><small>${max === undefined ? `至少 ${min.toLocaleString()}，不设最大值` : `范围 ${min.toLocaleString()}–${max.toLocaleString()}`}</small></label>`;
 }
 
 function preferredModel(models: string[], channel: Channel): string {
