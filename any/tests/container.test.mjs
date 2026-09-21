@@ -6,22 +6,31 @@ import { setTimeout as delay } from 'node:timers/promises';
 const origin = process.env.ANYROUTER_ORIGIN;
 assert.equal(process.env.COMPOSE_PROJECT_NAME, 'anyrouter-ci');
 assert.equal(origin, 'http://127.0.0.1:8787');
-const authorization = 'Basic ' + Buffer.from('admin:' + process.env.ANYROUTER_PASSWORD).toString('base64');
+let cookie = '';
+async function login() {
+  const response = await fetch(origin + '/api/auth/login', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: process.env.ANYROUTER_PASSWORD }) });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('set-cookie'), /HttpOnly; SameSite=Strict/);
+  cookie = response.headers.get('set-cookie').split(';')[0];
+}
 async function request(path, body) {
   const response = await fetch(origin + path, {
-    headers: { Authorization: authorization, 'Content-Type': 'application/json' },
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
     ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}),
     signal: AbortSignal.timeout(5000),
   });
   assert.ok(response.ok, `${path}: HTTP ${response.status}`);
   return response.json();
 }
-assert.equal((await fetch(origin)).status, 401);
+assert.equal((await fetch(origin)).status, 200);
+assert.equal((await fetch(origin + '/api/keys')).status, 401);
+await login();
 assert.equal((await request('/api/health')).python, true);
 assert.equal(execFileSync('docker', ['compose', 'exec', '-T', 'anyrouter', 'id', '-u'], { encoding: 'utf8' }).trim(), '1000');
+const key = await request('/api/keys', { alias: 'Container key', value: 'sk-container-test-only', baseUrl: 'http://127.0.0.1:1' });
 const task = await request('/api/python/tasks', {
-  token: 'sk-container-test-only',
-  config: { name: 'Container persistence check', channel: 'gpt', keyId: 'ci', baseUrl: 'http://127.0.0.1:1',
+  config: { name: 'Container persistence check', channel: 'gpt', keyId: key.id, baseUrl: 'http://127.0.0.1:1',
     model: 'gpt-ci', prompt: 'Reply OK', maxAttempts: 1, concurrency: 1, intervalSeconds: .5, timeoutSeconds: 30,
     keepalive: false, keepaliveMinSeconds: 60, keepaliveMaxSeconds: 90,
     telegramChatId: '', telegramBotToken: '', oneMillion: false },
@@ -38,7 +47,12 @@ for (let attempt = 0; attempt < 60; attempt++) {
   await delay(1000);
 }
 assert.equal(ready, true, 'Container did not recover after restart');
+assert.equal((await request('/api/auth/session')).authenticated, false);
+await login();
+assert.deepEqual((await request('/api/keys')).find(row => row.id === key.id), key);
 const restored = (await request('/api/python/tasks')).find(row => row.id === task.id);
 assert.equal(restored.sessionId, saved.sessionId);
 assert.equal(restored.status, saved.status);
-console.log('Container checks passed: authentication, non-root user, SQLite persistence, restart.');
+await request('/api/auth/logout', {});
+assert.equal((await request('/api/auth/session')).authenticated, false);
+console.log('Container checks passed: login/logout, server keys, non-root user, SQLite persistence, restart.');

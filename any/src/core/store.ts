@@ -1,15 +1,29 @@
-import { DEFAULT_SETTINGS } from './constants';
+import { DEFAULT_SETTINGS, STORAGE_KEYS } from './constants';
 import { AnyRouterGateway } from '../live/anyrouter-gateway';
 import { LiveTaskEngine } from '../live/live-task-engine';
 import { PythonTaskEngine } from '../live/python-task-engine';
 import { validateTaskConfig } from './task-config';
-import { loadKeys, loadSettings, loadTasks, saveKeys, saveSettings, saveTasks } from './storage';
+import { loadSettings, loadTasks, saveSettings, saveTasks } from './storage';
 import type { AppSettings, KeyRecord, SchedulerChoice, StoreChangeDetail, Task, TaskConfig } from './types';
-import { makeId } from './utils';
 import { normalizeApiBaseUrl } from './api-url';
+import { serverRequest } from './api-client';
+
+export async function loadServerKeys(): Promise<KeyRecord[]> {
+  const local = localStorage.getItem(STORAGE_KEYS.keys);
+  if (local) {
+    let keys: unknown;
+    try { keys = JSON.parse(local); }
+    catch { throw new Error('浏览器 Key 数据无效，未执行迁移'); }
+    if (!Array.isArray(keys)) throw new Error('浏览器 Key 数据无效，未执行迁移');
+    for (const key of keys) await serverRequest('/api/keys', 'POST', key);
+    localStorage.removeItem(STORAGE_KEYS.keys);
+  }
+  return serverRequest<KeyRecord[]>('/api/keys');
+}
 
 export class AppStore extends EventTarget {
-  keys = loadKeys();
+  keys: KeyRecord[];
+  private keysRevision = 0;
   settings = loadSettings();
   private readonly browser: LiveTaskEngine;
   readonly python: PythonTaskEngine;
@@ -38,8 +52,9 @@ export class AppStore extends EventTarget {
     if (this.browserUpdate !== undefined) this.flushBrowser();
   };
 
-  constructor() {
+  constructor(keys: KeyRecord[] = []) {
     super();
+    this.keys = keys;
     this.browser = new LiveTaskEngine({
       getKey: (id) => this.keys.find((key) => key.id === id)?.value,
       onChange: (immediate) => {
@@ -53,15 +68,25 @@ export class AppStore extends EventTarget {
   }
 
   async addKey(alias: string, value: string, baseUrl: string): Promise<KeyRecord> {
-    const record: KeyRecord = {
-      id: makeId('key'), alias: alias.trim(), value: value.trim(),
-      baseUrl: normalizeApiBaseUrl(baseUrl), authStatus: 'checking', models: [],
-    };
-    if (!record.alias || !record.value) throw new Error('别名和 API Key 不能为空');
+    ++this.keysRevision;
+    const record = await serverRequest<KeyRecord>('/api/keys', 'POST', { alias, value, baseUrl });
+    ++this.keysRevision;
     this.keys = [record, ...this.keys];
-    this.persistKeys();
+    this.emit('keys');
     await this.authenticateKey(record.id);
-    return record;
+    return this.keys.find(key => key.id === record.id) ?? record;
+  }
+
+  async refreshKeys(): Promise<void> {
+    const revision = ++this.keysRevision;
+    const keys = await serverRequest<KeyRecord[]>('/api/keys');
+    if (revision !== this.keysRevision) return;
+    if (JSON.stringify(keys) === JSON.stringify(this.keys)) return;
+    for (const task of this.browser.list()) {
+      if (!keys.some(key => key.id === task.config.keyId)) this.browser.cancel(task.id);
+    }
+    this.keys = keys;
+    this.emit('keys');
   }
 
   async authenticateKey(id: string, scheduler: SchedulerChoice = this.authScheduler): Promise<boolean> {
@@ -69,39 +94,49 @@ export class AppStore extends EventTarget {
     if (!record) return false;
     record.authStatus = 'checking';
     record.error = undefined;
-    this.persistKeys();
+    ++this.keysRevision;
+    this.emit('keys');
     const { value, baseUrl } = record;
     const results = await Promise.all([
       ...(scheduler !== 'python' ? [this.gateway.authenticate(value, baseUrl)] : []),
-      ...(scheduler !== 'browser' ? [this.python.authenticate(value, baseUrl)] : []),
+      ...(scheduler !== 'browser' ? [this.python.authenticate(id)] : []),
     ]);
     const result = results.find(item => !item.ok) ?? results[0];
     const current = this.keys.find((key) => key.id === id);
     if (!current || current.value !== value || current.baseUrl !== baseUrl) return false;
-    current.authStatus = result.ok ? 'ready' : 'error';
-    current.models = result.models;
-    current.error = result.error;
-    if (result.ok) current.lastAuthenticatedAt = Date.now();
-    this.persistKeys();
+    try {
+      const saved = await serverRequest<KeyRecord>(`/api/keys/${id}`, 'PATCH', { expectedBaseUrl: baseUrl, auth: result });
+      Object.assign(current, saved);
+      if (!saved.error) delete current.error;
+    } catch (error) {
+      current.authStatus = 'error';
+      current.error = error instanceof Error ? error.message : '鉴权结果保存失败';
+      throw error;
+    } finally { ++this.keysRevision; this.emit('keys'); }
     return result.ok;
   }
 
   async deleteKey(id: string): Promise<boolean> {
     if (!this.keys.some((key) => key.id === id)) return false;
-    for (const task of this.engine.list()) {
-      if (task.config.keyId === id) await this.engine.cancel(task.id);
+    ++this.keysRevision;
+    await serverRequest(`/api/keys/${id}`, 'DELETE');
+    ++this.keysRevision;
+    for (const task of this.browser.list()) {
+      if (task.config.keyId === id) this.browser.cancel(task.id);
     }
     this.keys = this.keys.filter((key) => key.id !== id);
-    this.persistKeys();
+    await this.python.refresh();
+    this.emit('keys');
     return true;
   }
 
   async updateKeyBaseUrl(id: string, baseUrl: string): Promise<boolean> {
     const record = this.keys.find((key) => key.id === id);
     if (!record) return false;
-    record.baseUrl = normalizeApiBaseUrl(baseUrl);
-    record.models = [];
-    record.lastAuthenticatedAt = undefined;
+    ++this.keysRevision;
+    const saved = await serverRequest<KeyRecord>(`/api/keys/${id}`, 'PATCH', { baseUrl });
+    ++this.keysRevision;
+    Object.assign(record, saved, { error: undefined, lastAuthenticatedAt: undefined });
     return this.authenticateKey(id);
   }
 
@@ -118,7 +153,7 @@ export class AppStore extends EventTarget {
     if (!key || key.authStatus !== 'ready') throw new Error('任务对应的 Key 未通过鉴权');
     config = validateTaskConfig({ ...config, baseUrl: key.baseUrl });
     const tasks: Task[] = [];
-    if (scheduler !== 'browser') tasks.push(await this.python.create(config, key.value));
+    if (scheduler !== 'browser') tasks.push(await this.python.create(config));
     if (scheduler !== 'python') tasks.push(this.browser.create(config));
     return tasks;
   }
@@ -134,6 +169,7 @@ export class AppStore extends EventTarget {
     this.onPageHide();
     globalThis.removeEventListener?.('pagehide', this.onPageHide);
     this.browser.dispose(); this.python.dispose();
+    this.keys = [];
   }
 
   private async action(id: string, action: 'pause' | 'resume' | 'retryNow' | 'cancel' | 'remove'): Promise<boolean> {
@@ -144,11 +180,6 @@ export class AppStore extends EventTarget {
   private async many(ids: string[], action: 'pause' | 'cancel' | 'remove'): Promise<number> {
     const results = await Promise.all(ids.map(id => this.action(id, action)));
     return results.filter(Boolean).length;
-  }
-
-  private persistKeys(): void {
-    saveKeys(this.keys);
-    this.emit('keys');
   }
 
   private emit(kind: StoreChangeDetail['kind']): void {

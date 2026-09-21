@@ -1,4 +1,5 @@
 import type { AuthResult, Task, TaskConfig } from '../core/types';
+import { serverRequest } from '../core/api-client';
 
 export class PythonTaskEngine {
   private tasks = new Map<string, Task>();
@@ -21,23 +22,17 @@ export class PythonTaskEngine {
   }
 
   private async request<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
-    const response = await fetch(`/api/python/${path}`, {
-      method, cache: 'no-store', signal: AbortSignal.timeout(30_000),
-      ...(body === undefined ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || `Python HTTP ${response.status}`);
-    return data as T;
+    return serverRequest<T>(`/api/python/${path}`, method, body);
   }
 
-  async authenticate(token: string, baseUrl: string): Promise<AuthResult> {
-    try { return await this.request<AuthResult>('models', 'POST', { token, baseUrl }); }
+  async authenticate(keyId: string): Promise<AuthResult> {
+    try { return await this.request<AuthResult>('models', 'POST', { keyId }); }
     catch (error) { return { ok: false, models: [], error: error instanceof Error ? error.message : 'Python 鉴权失败' }; }
   }
 
-  async create(config: TaskConfig, token: string): Promise<Task> {
+  async create(config: TaskConfig): Promise<Task> {
     ++this.revision;
-    const task = await this.request<Task>('tasks', 'POST', { config, token });
+    const task = await this.request<Task>('tasks', 'POST', { config });
     ++this.revision;
     this.tasks.set(task.id, task); this.onChange();
     return task;

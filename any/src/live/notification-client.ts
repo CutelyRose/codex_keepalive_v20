@@ -3,6 +3,7 @@ import type {
   NotificationPayload,
   NotificationReceipt,
 } from '../core/types';
+import { serverFetch } from '../core/api-client';
 
 export interface NotificationApiClientOptions {
   fetchImpl?: typeof fetch;
@@ -21,7 +22,7 @@ export class NotificationApiClient implements NotificationClient {
   private readonly baseUrl: string;
 
   constructor(options: NotificationApiClientOptions = {}) {
-    this.fetchImpl = options.fetchImpl ?? fetch.bind(globalThis);
+    this.fetchImpl = options.fetchImpl ?? serverFetch;
     this.baseUrl = options.baseUrl ?? '';
   }
 

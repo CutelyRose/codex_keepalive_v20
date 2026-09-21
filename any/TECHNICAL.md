@@ -10,6 +10,7 @@ flowchart LR
   Store --> Browser[LiveTaskEngine]
   Browser -->|HTTP / SSE| API[模型服务]
   Store -->|同源任务 API| Node[Node 本地服务]
+  Node --> Keys[服务器 Key 数据库]
   Node -->|stdio JSON| Python[Python WebRuntime]
   Python -->|HTTP / SSE| API
   Browser --> Notice[持久化通知队列]
@@ -24,13 +25,15 @@ AppStore 合并两端任务。ID 与 scheduler 标识执行者，操作路由到
 | 模块 | 职责 |
 | --- | --- |
 | src/core/store.ts | Key、默认设置、任务合并和操作路由 |
+| src/core/api-client.ts | 同源 Cookie 请求与登录失效处理 |
+| src/components/login-screen.ts | 管理密码登录页 |
 | src/core/task-config.ts | 浏览器引擎与服务端共用的任务验证 |
 | src/live/live-task-engine.ts | 浏览器探活、并发流、保活和通知 |
 | src/live/python-task-engine.ts | Python API 客户端和状态同步 |
 | src/live/request-builders.ts | 共用 GPT / Claude 请求构造 |
 | python-bridge.mjs | Python 子进程及 stdio 请求响应关联 |
 | python_scheduler.py | 根目录 codex_tasks.Runtime 的网页适配、HTTP 轮次和持久化 |
-| server.mjs | 静态文件、Python 任务接口和通知队列 |
+| server.mjs | 登录会话、Key 持久化、静态文件、Python 任务接口和通知队列 |
 
 Python 复用根目录调度器管理轮次、时间、并发占位和修订号；适配层处理并发 HTTP / SSE 及网页状态。根目录终端入口保持独立可用。
 
@@ -75,17 +78,33 @@ Python 最多同时执行 8 个轮次，未返回的物理请求仍占用位置�
 
 单流限制 2 MiB、摘要 8 KiB、事件 200 条；空闲上限 60 秒、总时限 10 分钟。无效 Key、模型和额度错误停止任务；HTTP 408/409/425/429/500/502/503/504/529 可重试。
 
-## Python 接口
+## 登录与 Key 接口
 
-服务默认监听 127.0.0.1。远程部署显式配置监听地址、站点 Origin 和管理密码；校验 Host / Origin，HTTP Basic 使用固定 admin 用户和恒定时间摘要比较。Python stdio 不对网络开放，内部通知回调携带相同认证并绕过系统代理。
+服务默认监听 127.0.0.1。远程部署显式配置监听地址、站点 Origin 和管理密码，校验 Host / Origin。页面和资源公开，业务 API 要求登录；本机未配置密码时可直接访问。管理密码使用恒定时间摘要比较，同一来源在一分钟内连续失败 5 次后返回 429。
+
+登录后颁发随机 Cookie，包含 HttpOnly、SameSite=Strict、Path=/ 和 7 天有效期；配置 HTTPS Origin 时增加 Secure。服务端内存只保存令牌摘要与过期时间，退出会撤销对应会话，服务重启后需要重新登录。不再支持 HTTP Basic。Python stdio 不对网络开放，通知回调使用每次启动生成的专用 Bearer 凭证，仅允许本机 POST 通知接口，并绕过系统代理。
+
+| 接口 | 输入 / 结果 |
+| --- | --- |
+| GET /api/auth/session | {authenticated, passwordRequired} |
+| POST /api/auth/login | {password}，校验后设置登录 Cookie |
+| POST /api/auth/logout | 撤销当前会话并清除 Cookie |
+| GET /api/keys | 已登录客户端共享的 KeyRecord 列表 |
+| POST /api/keys | {alias, value, baseUrl}；迁移时可带原 id、鉴权结果和模型缓存，同 ID 不覆盖已存凭据 |
+| PATCH /api/keys/{id} | {baseUrl} 修改地址并清空模型缓存；或 {expectedBaseUrl, auth: AuthResult} 保存鉴权结果 |
+| DELETE /api/keys/{id} | 取消关联 Python 任务并删除 Key |
+
+Key 存在 `data/notifications.sqlite` 的 `api_keys` 表，沿用服务器受限数据目录。Key 原文只对已登录的管理界面开放，供浏览器直接请求模型服务；前端不再持久化 Key。首次进入工作区时导入当前浏览器 Key，保留 ID；全部写入成功才清除原副本，重复导入按 ID 去重。地址变更后拒绝保存基于旧地址的鉴权结果。列表在工作区加载、进入 Key / 新建任务页面及手动刷新时读取。
+
+## Python 接口
 
 | 接口 | 输入 / 结果 |
 | --- | --- |
 | GET /api/health | 无需认证；检查 Python 调度线程，失败返回 503 |
-| POST /api/python/models | {baseUrl, token}，由 Python 鉴权并读取模型 |
+| POST /api/python/models | {keyId}，从服务器读取 Key 和地址，由 Python 鉴权并读取模型 |
 | GET /api/python/tasks | 任务概要，events 与 responseSummary 为空；不返回模型 Key、ShowDoc 推送 URL、Bot Token 或 SendKey |
 | GET /api/python/tasks?detail={id} | 仅指定任务携带事件和响应摘要 |
-| POST /api/python/tasks | {config: TaskConfig, token}，创建任务 |
+| POST /api/python/tasks | {config: TaskConfig}，按 config.keyId 读取服务器凭据和地址，创建任务 |
 | POST /api/python/tasks/{id}/pause | 暂停 |
 | POST /api/python/tasks/{id}/resume | 继续 |
 | POST /api/python/tasks/{id}/retryNow | 跳过等待，立即请求 |
@@ -97,7 +116,7 @@ Python 最多同时执行 8 个轮次，未返回的物理请求仍占用位置�
 
 ## 保存与恢复
 
-浏览器使用 anyrouter-console: localStorage。普通流事件按 250 ms 合并保存，关键状态即时保存；离开页面时刷新待写状态。活动任务刷新后暂停；已成功的一次性流中断后保持终态。
+浏览器使用 anyrouter-console: localStorage 保存任务、默认设置和主题。普通流事件按 250 ms 合并保存，关键状态即时保存；离开页面时刷新待写状态。活动任务刷新后暂停；已成功的一次性流中断后保持终态。
 
 Python 使用 `data/python-tasks.sqlite` 保存任务、事件、计数和连接快照，复用受调度锁保护的 SQLite 连接并启用 WAL。Windows 复用根目录 DPAPI；Linux/macOS 目录权限 700、数据库权限 600。重启恢复启用任务，暂停和终态不自动启动；已确认成功的一次性任务不重复请求。
 
@@ -115,4 +134,4 @@ Server 酱请求与官方 serverchan-sdk 1.0.6 的 sc_send 协议一致：SCT �
 
 Docker / 1Panel 配置及单实例部署边界见 [DEPLOY.md](../DEPLOY.md)；性能数据见 [PERFORMANCE.md](PERFORMANCE.md)。镜像支持 amd64 / arm64，工作流在发布 latest 前检查容器认证和 SQLite 重启恢复。浏览器 UUID 统一通过 `crypto.getRandomValues` 生成，支持通过 HTTP 的服务器 IP 直接访问。
 
-`npm run check` 检查类型。`npm test` 使用独立临时数据和本机 HTTP 服务验证协议、SSE 首事件成功、系统代理、双端超过 16 个请求的并发、大数值配置保存、保活恢复、稳定会话、暂停删除、Python 重启恢复、三种通知平台、远程认证、概要与详情及浏览器写入合并，不访问真实上游。
+`npm run check` 检查类型。`npm test` 使用独立临时数据和本机 HTTP 服务验证协议、SSE 首事件成功、系统代理、双端超过 16 个请求的并发、大数值配置保存、保活恢复、稳定会话、暂停删除、Python 重启恢复、三种通知平台、登录过期与退出、Key 迁移和共享持久化、概要与详情及浏览器写入合并，不访问真实上游。

@@ -351,7 +351,7 @@ class WebRuntime(Runtime):
                     if kind in ('error', 'response.failed'):
                         raise ValueError(raw[:500])
 
-            while True:
+            while not response.isclosed():
                 elapsed = self.clock() - started
                 remaining = min(600 - elapsed, 60 - (self.clock() - last_data))
                 if not outcome['accepted']:

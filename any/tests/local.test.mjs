@@ -33,7 +33,7 @@ await build({
   outfile: bundlePath, bundle: true, platform: 'node', format: 'esm', logLevel: 'silent',
 });
 const { LiveTaskEngine, AnyRouterGateway, SseParser, readSseStream,
-  retryableModelError, retryAfterMilliseconds, saveTasks, loadTasks, saveSettings, loadSettings, AppStore, createClaudeRequestIdentity, createCodexRequestIdentity } = await import(pathToFileURL(bundlePath));
+  retryableModelError, retryAfterMilliseconds, saveTasks, loadTasks, saveSettings, loadSettings, loadServerKeys, AppStore, createClaudeRequestIdentity, createCodexRequestIdentity } = await import(pathToFileURL(bundlePath));
 
 async function until(check, message) {
   const deadline = Date.now() + 5000;
@@ -43,6 +43,22 @@ async function until(check, message) {
     await delay(20);
   }
   assert.fail(message);
+}
+
+async function loginCookie(app, password) {
+  const response = await fetch(app.url + '/api/auth/login', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
+  assert.equal(response.status, 200);
+  const cookie = response.headers.get('set-cookie');
+  assert.match(cookie, /HttpOnly; SameSite=Strict/);
+  return cookie.split(';')[0];
+}
+
+async function saveKey(app, record, cookie = '') {
+  const response = await fetch(app.url + '/api/keys', { method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify(record) });
+  assert.equal(response.status, 201);
+  return response.json();
 }
 
 test('SSE byte boundaries, cancellation and retry classification', async () => {
@@ -285,6 +301,10 @@ test('browser and Python run together, recover keepalive and preserve backend ow
       res.end('{"error":{"message":"' + (body.model === 'gpt-fatal' ? 'invalid_api_key' : 'busy') + '"}}'); return;
     }
     res.setHeader('Content-Type', 'text/event-stream');
+    if (body.model === 'gpt-fixed-length') {
+      res.end('event: response.created\ndata: {"type":"response.created"}\n\ndata: [DONE]\n\n');
+      return;
+    }
     if (body.model === 'gpt-parallel' && count > 1 || body.model === 'gpt-held') {
       res.write('event: ping\ndata: {"type":"ping"}\n\n');
       res.on('close', () => { closedLosers++; });
@@ -319,10 +339,11 @@ test('browser and Python run together, recover keepalive and preserve backend ow
   const config = { name: 'Dual keepalive', channel: 'gpt', keyId: 'dual', baseUrl, model: 'gpt-python', prompt: 'Reply OK',
     maxAttempts: 2, concurrency: 1, intervalSeconds: .5, timeoutSeconds: 30, keepalive: true,
     keepaliveMinSeconds: .5, keepaliveMaxSeconds: .5, telegramChatId: '', telegramBotToken: '', oneMillion: false };
-  const auth = await call('models', 'POST', { baseUrl, token: 'sk-dual-test-only' });
+  await saveKey(app, { id: 'dual', alias: 'Dual', value: 'sk-dual-test-only', baseUrl });
+  const auth = await call('models', 'POST', { keyId: 'dual' });
   assert.equal(auth.ok, true);
   const local = browser.create({ ...config, model: 'gpt-browser' });
-  const remote = await call('tasks', 'POST', { config, token: 'sk-dual-test-only' });
+  const remote = await call('tasks', 'POST', { config });
   assert.equal(remote.scheduler, 'python');
   assert.equal(JSON.stringify(remote).includes('sk-dual-test-only'), false);
   await until(() => local.successes >= 2 && seen.get('gpt-python') >= 3, 'both schedulers failed to recover keepalive');
@@ -362,26 +383,28 @@ test('browser and Python run together, recover keepalive and preserve backend ow
   await until(() => seen.get('gpt-python') > stoppedCount, 'active task did not recover after service restart');
   await call(`tasks/${remote.id}/cancel`, 'POST');
 
-  const parallel = await call('tasks', 'POST', { config: { ...config, model: 'gpt-parallel', keepalive: false, concurrency: 24, maxAttempts: 20 }, token: 'sk-dual-test-only' });
+  const parallel = await call('tasks', 'POST', { config: { ...config, model: 'gpt-parallel', keepalive: false, concurrency: 24, maxAttempts: 20 } });
   const completed = await until(async () => (await call('tasks')).find(task => task.id === parallel.id && task.status === 'accepted-completed'), 'Python parallel round did not finish');
   assert.equal(completed.attemptsMade, 20);
   assert.equal(completed.successes, 1);
   assert.equal(closedLosers, 19);
-  const claude = await call('tasks', 'POST', { config: { ...config, channel: 'claude', model: 'claude-python[1m]', keepalive: false }, token: 'sk-dual-test-only' });
+  const claude = await call('tasks', 'POST', { config: { ...config, channel: 'claude', model: 'claude-python[1m]', keepalive: false } });
   await until(async () => (await call('tasks')).some(task => task.id === claude.id && task.status === 'accepted-completed'), 'Python Claude did not complete');
   const claudeRequest = requests.find(item => item.body.model === 'claude-python');
   assert.equal(claudeRequest.body.tools.length, 26);
   assert.match(claudeRequest.headers['anthropic-beta'], /context-1m/);
-  const fatal = await call('tasks', 'POST', { config: { ...config, model: 'gpt-fatal' }, token: 'sk-dual-test-only' });
+  const fixedLength = await call('tasks', 'POST', { config: { ...config, model: 'gpt-fixed-length', keepalive: false } });
+  await until(async () => (await call('tasks')).some(task => task.id === fixedLength.id && task.status === 'accepted-completed'), 'Python fixed-length SSE did not complete');
+  const fatal = await call('tasks', 'POST', { config: { ...config, model: 'gpt-fatal' } });
   await until(async () => (await call('tasks')).some(task => task.id === fatal.id && task.stopReason === 'permanent-error'), 'Python did not stop a permanent failure');
   assert.equal(seen.get('gpt-fatal'), 1);
-  const held = await call('tasks', 'POST', { config: { ...config, model: 'gpt-held' }, token: 'sk-dual-test-only' });
+  const held = await call('tasks', 'POST', { config: { ...config, model: 'gpt-held' } });
   await until(() => seen.has('gpt-held'), 'Python held stream did not start');
   await call(`tasks/${held.id}`, 'DELETE');
   await until(() => closedLosers === 20, 'Python delete did not stop the held stream');
   assert.equal((await call('tasks')).some(task => task.id === held.id), false);
   const invalid = await fetch(`${app.url}/api/python/tasks`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ config: { ...config, keepaliveMinSeconds: 20, keepaliveMaxSeconds: 10 }, token: 'sk-dual-test-only' }) });
+    body: JSON.stringify({ config: { ...config, keepaliveMinSeconds: 20, keepaliveMaxSeconds: 10 } }) });
   assert.equal(invalid.status, 400);
   const db = new DatabaseSync(join(directory, 'dual', 'python-tasks.sqlite'), { readOnly: true });
   try {
@@ -461,13 +484,15 @@ test('Python recognizes success before EOF and uses the same proxy as authentica
     assert.equal(response.ok, true, JSON.stringify(data));
     return data;
   };
-  assert.equal((await call('models', { baseUrl: target, token: 'sk-proxy-test-only' })).ok, true);
+  await saveKey(app, { id: 'proxy-test', alias: 'Proxy', value: 'sk-proxy-test-only', baseUrl: target });
+  await saveKey(app, { id: 'direct-test', alias: 'Direct', value: 'sk-proxy-test-only', baseUrl: proxyUrl });
+  assert.equal((await call('models', { keyId: 'proxy-test' })).ok, true);
   for (const [channel, baseUrl] of [['gpt', proxyUrl], ['gpt', target], ['claude', target]]) {
-    const config = { name: 'Stream success', channel, keyId: 'proxy-test', baseUrl,
+    const config = { name: 'Stream success', channel, keyId: baseUrl === target ? 'proxy-test' : 'direct-test', baseUrl,
       model: `${channel}-${baseUrl === target ? 'proxy' : 'direct'}`, prompt: 'Reply OK',
       maxAttempts: 2, concurrency: 1, intervalSeconds: .5, timeoutSeconds: 30, keepalive: baseUrl === target,
       keepaliveMinSeconds: 60, keepaliveMaxSeconds: 90, telegramChatId: '', telegramBotToken: '', oneMillion: false };
-    const task = await call('tasks', { config, token: 'sk-proxy-test-only' });
+    const task = await call('tasks', { config });
     const accepted = await until(async () => (await call('tasks')).find(row =>
       row.id === task.id && row.status === 'accepted-streaming'), `${config.model} did not recognize success while the stream was open`);
     assert.equal(accepted.successes, 1);
@@ -512,9 +537,9 @@ test('protected deployment delivers ServerChan from both schedulers and restores
     dbPath: join(directory, 'serverchan', 'notifications.sqlite'), now: () => clock, serverchanBaseUrl: baseUrl };
   await assert.rejects(startServer({ host: '0.0.0.0', port: 0 }), /ANYROUTER_ORIGIN/);
   let app = await startServer(options);
-  const authorization = 'Basic ' + Buffer.from('admin:' + options.password).toString('base64');
+  let cookie = await loginCookie(app, options.password);
   const request = (path, body, headers = {}) => fetch(app.url + path, {
-    headers: { Authorization: authorization, ...(body ? { 'Content-Type': 'application/json' } : {}), ...headers },
+    headers: { Cookie: cookie, ...(body ? { 'Content-Type': 'application/json' } : {}), ...headers },
     ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}),
   });
   const receipt = async id => (await request(`/api/notifications/${id}`)).json();
@@ -527,15 +552,16 @@ test('protected deployment delivers ServerChan from both schedulers and restores
     browser.dispose(); await app.close(); upstream.closeAllConnections();
     await new Promise(resolveClose => upstream.close(resolveClose));
   });
-  for (const path of ['/', '/assets/app.js', '/api/python/tasks']) {
+  for (const path of ['/api/keys', '/api/python/tasks']) {
     const denied = await fetch(app.url + path);
     assert.equal(denied.status, 401);
-    assert.match(denied.headers.get('www-authenticate'), /Basic/);
+    assert.equal(denied.headers.get('www-authenticate'), null);
   }
+  for (const path of ['/', '/assets/app.js']) assert.equal((await fetch(app.url + path)).status, 200);
   assert.equal((await (await fetch(app.url + '/api/health')).json()).ok, true);
-  assert.equal((await request('/', undefined, { Authorization: 'Basic invalid' })).status, 401);
+  assert.equal((await request('/api/python/tasks', undefined, { Cookie: 'anyrouter_session=invalid' })).status, 401);
   const hostStatus = host => new Promise((resolveResponse, reject) => {
-    httpGet(app.url, { headers: { Host: host, Authorization: authorization, Origin: options.origin,
+    httpGet(app.url, { headers: { Host: host, Cookie: cookie, Origin: options.origin,
       'X-Forwarded-Host': 'console.example.test' } }, response => {
       response.resume(); resolveResponse(response.statusCode);
     }).on('error', reject);
@@ -549,7 +575,8 @@ test('protected deployment delivers ServerChan from both schedulers and restores
     keepaliveMinSeconds: 60, keepaliveMaxSeconds: 90, telegramChatId: '', telegramBotToken: '',
     serverchanSendKey: 'SCTserverchan-test-only', serverchanTags: '服务器报警|图片', oneMillion: false };
   const local = browser.create(config);
-  const created = await request('/api/python/tasks', { config: { ...config, name: 'Python ServerChan' }, token: 'sk-serverchan-test-only' });
+  await saveKey(app, { id: 'local', alias: 'ServerChan', value: 'sk-serverchan-test-only', baseUrl }, cookie);
+  const created = await request('/api/python/tasks', { config: { ...config, name: 'Python ServerChan' } });
   assert.equal(created.status, 201);
   const remote = await created.json();
   assert.equal(remote.config.serverchanSendKey, '');
@@ -570,6 +597,7 @@ test('protected deployment delivers ServerChan from both schedulers and restores
   const pending = await (await request('/api/notifications', payload)).json();
   await until(async () => (await receipt(pending.id)).status === 'retrying', 'ServerChan did not retry HTTP 429');
   await app.close(); clock += 1000; app = await startServer(options);
+  cookie = await loginCookie(app, options.password);
   await until(async () => (await receipt(pending.id)).status === 'sent', 'ServerChan retry did not survive restart');
   assert.equal((await (await request('/api/notifications', payload)).json()).id, pending.id);
   assert.equal(counts.get('任务已接入：Retry restart'), 2);
@@ -627,7 +655,8 @@ test('ShowDoc delivers from both schedulers, restores retries and protects push 
     keepaliveMinSeconds: 60, keepaliveMaxSeconds: 90, telegramChatId: '', telegramBotToken: '',
     showdocPushUrl: showdocUrl, oneMillion: false };
   const local = browser.create(config);
-  const created = await post('/api/python/tasks', { config: { ...config, name: 'Python ShowDoc' }, token: 'sk-showdoc-test-only' });
+  await saveKey(app, { id: 'local', alias: 'ShowDoc', value: 'sk-showdoc-test-only', baseUrl });
+  const created = await post('/api/python/tasks', { config: { ...config, name: 'Python ShowDoc' } });
   assert.equal(created.status, 201);
   const remote = await created.json();
   assert.equal(remote.config.showdocPushUrl, '');
@@ -665,6 +694,123 @@ test('ShowDoc delivers from both schedulers, restores retries and protects push 
   try {
     assert.ok(db.prepare('SELECT payload FROM notifications').all().every(row => !row.payload.includes('showdoc-test-only')));
   } finally { db.close(); }
+});
+
+test('login protects shared server keys, migration is resumable and key data survives restart', async t => {
+  const seen = [];
+  const upstream = createServer((req, res) => {
+    req.resume();
+    seen.push({ url: req.url, authorization: req.headers.authorization });
+    if (req.url.endsWith('/models')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"data":[{"id":"gpt-shared"}]}');
+    } else {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write('event: ping\ndata: {"type":"ping"}\n\n');
+    }
+  });
+  await new Promise(done => upstream.listen(0, '127.0.0.1', done));
+  const baseUrl = `http://127.0.0.1:${upstream.address().port}`;
+  let clock = Date.now();
+  const options = { port: 0, password: 'shared-admin-test-only', origin: 'https://shared.example.test',
+    dbPath: join(directory, 'shared-keys', 'notifications.sqlite'), now: () => clock };
+  let app = await startServer(options), store;
+  const data = new Map(), nativeFetch = globalThis.fetch;
+  const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+    getItem: key => data.get(key) ?? null, setItem: (key, value) => data.set(key, value), removeItem: key => data.delete(key),
+  } });
+  t.after(async () => {
+    store?.dispose(); await app.close(); upstream.closeAllConnections();
+    await new Promise(done => upstream.close(done));
+    if (storageDescriptor) Object.defineProperty(globalThis, 'localStorage', storageDescriptor);
+    else delete globalThis.localStorage;
+  });
+  const request = (path, method = 'GET', body, cookie = '') => nativeFetch(app.url + path, {
+    method, headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  assert.equal((await (await request('/api/auth/session')).json()).authenticated, false);
+  assert.equal((await request('/api/keys')).status, 401);
+  assert.equal((await nativeFetch(app.url + '/api/keys', {
+    headers: { Authorization: 'Basic ' + Buffer.from('admin:' + options.password).toString('base64') },
+  })).status, 401);
+  assert.equal((await nativeFetch(app.url + '/api/auth/login', { method: 'POST',
+    headers: { Origin: 'https://untrusted.example', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: options.password }) })).status, 403);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    assert.equal((await request('/api/auth/login', 'POST', { password: 'wrong' })).status, 401);
+  }
+  const limited = await request('/api/auth/login', 'POST', { password: options.password });
+  assert.equal(limited.status, 429);
+  assert.equal(limited.headers.get('retry-after'), '60');
+  clock += 60_000;
+  const login = await request('/api/auth/login', 'POST', { password: options.password });
+  assert.equal(login.status, 200);
+  assert.match(login.headers.get('set-cookie'), /HttpOnly; SameSite=Strict; Max-Age=604800; Secure/);
+  let cookie = login.headers.get('set-cookie').split(';')[0];
+  const otherCookie = await loginCookie(app, options.password);
+  assert.notEqual(cookie, otherCookie);
+  t.mock.method(globalThis, 'fetch', (input, init) => typeof input === 'string' && input.startsWith('/')
+    ? nativeFetch(app.url + input, { ...init, headers: { ...init?.headers, Cookie: cookie } })
+    : nativeFetch(input, init));
+
+  const storageKey = 'anyrouter-console:keys:v1';
+  const first = { id: 'key_import_1', alias: 'Imported one', value: 'sk-import-one-test-only', baseUrl,
+    authStatus: 'ready', models: ['gpt-shared'] };
+  const second = { ...first, id: 'key_import_2', alias: 'Imported two', value: 'bad' };
+  data.set(storageKey, JSON.stringify([first, second]));
+  await assert.rejects(loadServerKeys(), /API Key/);
+  assert.ok(data.has(storageKey), 'failed migration erased the original keys');
+  assert.equal((await (await request('/api/keys', 'GET', undefined, otherCookie)).json()).length, 1);
+  second.value = 'sk-import-two-test-only';
+  data.set(storageKey, JSON.stringify([first, second]));
+  const imported = await loadServerKeys();
+  assert.equal(data.has(storageKey), false);
+  assert.equal(imported.length, 2, 'retrying migration duplicated a key');
+  assert.deepEqual(imported.find(key => key.id === first.id), first);
+  assert.deepEqual(await (await request('/api/keys', 'GET', undefined, otherCookie)).json(), imported);
+  assert.equal((await request('/api/keys', 'POST', { ...first, value: 'sk-different-test-only' }, cookie)).status, 409);
+  assert.equal((await request('/api/keys', 'POST', { ...first, id: 'bad/id' }, cookie)).status, 400);
+
+  clock = Date.now();
+  store = new AppStore(imported);
+  const key = await store.addKey('Shared key', 'sk-shared-test-only', baseUrl);
+  assert.equal(key.authStatus, 'ready');
+  assert.deepEqual(key.models, ['gpt-shared']);
+  assert.equal(await store.updateKeyBaseUrl(key.id, baseUrl + '/changed/v1'), true);
+  assert.equal(key.baseUrl, baseUrl + '/changed');
+  assert.equal((await request(`/api/keys/${key.id}`, 'PATCH', { expectedBaseUrl: baseUrl,
+    auth: { ok: true, models: ['stale-model'] } }, otherCookie)).status, 409);
+  const shared = (await (await request('/api/keys', 'GET', undefined, otherCookie)).json()).find(row => row.id === key.id);
+  assert.equal(shared.baseUrl, key.baseUrl);
+  assert.deepEqual(shared.models, ['gpt-shared']);
+  assert.equal(data.has(storageKey), false, 'key edits wrote a browser credential copy');
+  const config = { name: 'Shared credential task', channel: 'gpt', keyId: key.id, baseUrl: 'http://127.0.0.1:1',
+    model: 'gpt-shared', prompt: 'Reply OK', maxAttempts: 1, concurrency: 1, intervalSeconds: .5, timeoutSeconds: 30,
+    keepalive: false, keepaliveMinSeconds: 60, keepaliveMaxSeconds: 90, telegramChatId: '', telegramBotToken: '', oneMillion: false };
+  const created = await request('/api/python/tasks', 'POST', { config, token: 'sk-must-not-be-used' }, otherCookie);
+  assert.equal(created.status, 201);
+  const task = await created.json();
+  assert.equal(task.config.baseUrl, key.baseUrl);
+  await until(() => seen.some(item => item.url === '/changed/v1/responses'), 'Python did not use the server key address');
+  assert.ok(seen.every(item => item.authorization === 'Bearer sk-shared-test-only'));
+  assert.equal((await request(`/api/keys/${key.id}`, 'DELETE', undefined, otherCookie)).status, 200);
+  await store.refreshKeys();
+  assert.equal(store.keys.some(row => row.id === key.id), false);
+  const cancelled = (await (await request('/api/python/tasks', 'GET', undefined, cookie)).json()).find(row => row.id === task.id);
+  assert.equal(cancelled.status, 'cancelled');
+  store.dispose();
+
+  await app.close(); app = await startServer(options);
+  assert.equal((await request('/api/keys', 'GET', undefined, cookie)).status, 401);
+  cookie = await loginCookie(app, options.password);
+  assert.deepEqual((await (await request('/api/keys', 'GET', undefined, cookie)).json()).map(row => row.id).sort(), [first.id, second.id]);
+  clock += 7 * 24 * 60 * 60 * 1000;
+  assert.equal((await request('/api/keys', 'GET', undefined, cookie)).status, 401);
+  cookie = await loginCookie(app, options.password);
+  assert.equal((await request('/api/auth/logout', 'POST', undefined, cookie)).status, 200);
+  assert.equal((await request('/api/keys', 'GET', undefined, cookie)).status, 401, 'logout left the cookie authorized');
 });
 
 test('stream progress batches storage writes while success, pagehide and pause persist immediately', async t => {

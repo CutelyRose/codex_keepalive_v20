@@ -1,6 +1,5 @@
 import { DEFAULT_SETTINGS, LIMITS, STORAGE_KEYS } from './constants';
-import { DEFAULT_API_BASE_URL, normalizeApiBaseUrl } from './api-url';
-import type { AppSettings, KeyRecord, Task, TaskEvent, TaskStatus, NotificationStatus } from './types';
+import type { AppSettings, Task, TaskEvent, TaskStatus, NotificationStatus } from './types';
 import { clampSetting, truncateUtf8 } from './utils';
 import { notificationConfigured, validateNotificationSettings, validateTaskConfig } from './task-config';
 
@@ -19,45 +18,6 @@ function safeParse<T>(raw: string | null, fallback: T): T {
   } catch {
     return fallback;
   }
-}
-
-export function loadKeys(storage: Storage = localStorage): KeyRecord[] {
-  const parsed = safeParse<unknown>(storage.getItem(STORAGE_KEYS.keys), []);
-  if (!Array.isArray(parsed)) return [];
-
-  return parsed.flatMap((candidate): KeyRecord[] => {
-    if (!candidate || typeof candidate !== 'object') return [];
-    const value = candidate as Partial<KeyRecord>;
-    if (
-      typeof value.id !== 'string' ||
-      typeof value.alias !== 'string' ||
-      typeof value.value !== 'string'
-    ) {
-      return [];
-    }
-    const record: KeyRecord = {
-      id: value.id,
-      alias: value.alias,
-      value: value.value,
-      baseUrl: normalizeStoredBaseUrl(value.baseUrl),
-      authStatus:
-        value.authStatus === 'ready' || value.authStatus === 'error'
-          ? value.authStatus
-          : 'checking',
-      models: Array.isArray(value.models)
-        ? value.models.filter((model): model is string => typeof model === 'string')
-        : [],
-    };
-    if (typeof value.lastAuthenticatedAt === 'number') {
-      record.lastAuthenticatedAt = value.lastAuthenticatedAt;
-    }
-    if (typeof value.error === 'string') record.error = value.error;
-    return [record];
-  });
-}
-
-export function saveKeys(keys: KeyRecord[], storage: Storage = localStorage): void {
-  storage.setItem(STORAGE_KEYS.keys, JSON.stringify(keys));
 }
 
 export function loadTasks(storage: Storage = localStorage): Task[] {
@@ -172,13 +132,4 @@ export function saveSettings(settings: AppSettings, storage: Storage = localStor
     ...validateNotificationSettings(settings),
   };
   storage.setItem(STORAGE_KEYS.settings, JSON.stringify(normalized));
-}
-
-function normalizeStoredBaseUrl(value: unknown): string {
-  if (typeof value !== 'string') return DEFAULT_API_BASE_URL;
-  try {
-    return normalizeApiBaseUrl(value);
-  } catch {
-    return DEFAULT_API_BASE_URL;
-  }
 }

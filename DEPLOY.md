@@ -35,7 +35,7 @@ ANYROUTER_PASSWORD=替换为随机管理密码
 
 在 1Panel 的环境变量表单中直接填写值，不要额外加引号。镜像已监听 `0.0.0.0:8787`，无需修改容器内部端口。
 
-放行宿主机对应端口后，打开 `http://实际服务器IP:8787`，用户名为 `admin`。若改用宿主机端口 `9000`，端口映射填 `9000:8787`，`ANYROUTER_ORIGIN` 同时改为 `http://实际服务器IP:9000`。地址必须与浏览器访问地址一致，不带路径；403 时先检查该配置。
+放行宿主机对应端口后，打开 `http://实际服务器IP:8787`，在登录页输入 `ANYROUTER_PASSWORD`。若改用宿主机端口 `9000`，端口映射填 `9000:8787`，`ANYROUTER_ORIGIN` 同时改为 `http://实际服务器IP:9000`。地址必须与浏览器访问地址一致，不带路径；403 时先检查该配置。
 
 ## 3. 使用 Compose 部署
 
@@ -64,7 +64,9 @@ docker compose logs --tail=50
 curl -fsS http://127.0.0.1:8787/api/health
 ```
 
-健康接口无需登录，只返回 Node / Python 调度可用状态。页面、任务和配置使用管理密码认证。
+健康接口无需登录，只返回 Node / Python 调度可用状态。登录页公开，Key 和任务接口要求登录。登录凭证使用 HttpOnly Cookie，有效期 7 天；退出登录、服务重启或修改管理密码后需重新登录。右上角可退出登录，Python 任务继续运行。
+
+Key、别名、服务地址和模型缓存统一保存在数据卷内 `notifications.sqlite` 的 `api_keys` 表。原浏览器 Key 在首次进入工作区时迁入服务器，保留原 ID；全部写入成功后才清除本地副本，失败可重试。更换设备后登录同一站点，进入 Key 管理即可读取服务器列表。
 
 在设置或新建任务的「成功通知」中先选择推送方式，再填写显示的参数；留空关闭通知：
 
@@ -96,7 +98,7 @@ docker compose cp anyrouter:/app/any/data ./backup/
 docker compose start
 ```
 
-恢复时先停止容器，执行 `docker compose cp ./backup/data/. anyrouter:/app/any/data/`，通过 1Panel 将数据目录属主设为 `1000:1000`、目录权限 `700`、数据库权限 `600`，再启动。备份包含任务连接凭据，应保存在受限目录。
+恢复时先停止容器，执行 `docker compose cp ./backup/data/. anyrouter:/app/any/data/`，通过 1Panel 将数据目录属主设为 `1000:1000`、目录权限 `700`、数据库权限 `600`，再启动。备份包含服务器 Key 和任务连接凭据，应保存在受限目录。
 
 Windows 本地 Python 数据受当前用户 DPAPI 保护，不能直接复制到 Linux 容器；在部署站点重新添加 Key 和任务。浏览器 localStorage 随浏览器和站点地址区分，首次访问服务器站点需要重新配置浏览器任务。
 

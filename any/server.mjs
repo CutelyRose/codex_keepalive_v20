@@ -1,18 +1,20 @@
 import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { PythonBridge } from './python-bridge.mjs';
-import { buildTaskRequest, validateTaskConfig, apiEndpoint, notificationConfigured,
+import { buildTaskRequest, validateTaskConfig, apiEndpoint, normalizeApiBaseUrl, notificationConfigured,
   validateNotificationSettings, serverchanEndpoint } from './dist/task-requests.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const RETRYABLE_HTTP = new Set([408, 409, 425, 429, 500, 502, 503, 504, 529]);
+const SESSION_SECONDS = 7 * 24 * 60 * 60;
 
 function problem(status, message) { return Object.assign(new Error(message), { status }); }
+function digest(value) { return createHash('sha256').update(value).digest(); }
 
 function textField(value, name, max) {
   if (typeof value !== 'string' || !value.trim() || value.length > max) {
@@ -24,6 +26,25 @@ function textField(value, name, max) {
 function numberField(value, name) {
   if (!Number.isSafeInteger(value) || value < 0) throw problem(400, `${name} 必须为非负整数`);
   return value;
+}
+
+function keyRecord(input) {
+  const id = input.id === undefined ? `key_${randomUUID()}` : textField(input.id, 'Key ID', 160);
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) throw problem(400, 'Key ID 格式无效');
+  const value = textField(input.value, 'API Key', 256);
+  if (value.length < 8 || /\s/.test(value)) throw problem(400, 'API Key 格式无效');
+  let baseUrl;
+  try { baseUrl = normalizeApiBaseUrl(textField(input.baseUrl, 'API Base URL', 500)); }
+  catch (error) { throw problem(400, error.message); }
+  const authStatus = input.authStatus ?? 'checking', models = input.models ?? [];
+  if (!['checking', 'ready', 'error'].includes(authStatus) || !Array.isArray(models) ||
+      models.length > 2000 || models.some(model => typeof model !== 'string' || !model || model.length > 160)) {
+    throw problem(400, 'Key 鉴权状态或模型列表无效');
+  }
+  if (input.error !== undefined && typeof input.error !== 'string') throw problem(400, 'Key 错误信息无效');
+  return { id, alias: textField(input.alias, '别名', 40), value, baseUrl, authStatus, models: [...new Set(models)].sort(),
+    ...(input.lastAuthenticatedAt === undefined ? {} : { lastAuthenticatedAt: numberField(input.lastAuthenticatedAt, '鉴权时间') }),
+    ...(input.error ? { error: safeError(input.error, value) } : {}) };
 }
 
 function notificationPayload(input) {
@@ -100,13 +121,16 @@ export async function startServer({
   if (!['127.0.0.1', '::1', 'localhost'].includes(host) && (!origin || !password)) {
     throw new Error('远程监听必须配置 ANYROUTER_ORIGIN 和 ANYROUTER_PASSWORD');
   }
-  const authorization = password ? 'Basic ' + Buffer.from('admin:' + password).toString('base64') : '';
-  const authDigest = createHash('sha256').update(authorization).digest();
+  const passwordDigest = digest(password);
+  const internalAuthorization = `Bearer ${randomBytes(32).toString('base64url')}`;
+  const internalDigest = digest(internalAuthorization);
+  const sessions = new Map(), loginFailures = new Map();
   process.umask(0o077);
   await mkdir(dirname(resolve(dbPath)), { recursive: true, mode: 0o700 });
   const db = new DatabaseSync(dbPath);
   db.exec(`PRAGMA journal_mode=WAL;
-    CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE, payload TEXT NOT NULL);`);
+    CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE, payload TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, payload TEXT NOT NULL);`);
   const notifications = new Map(db.prepare("SELECT id,payload FROM notifications WHERE json_extract(payload, '$.status') IN ('queued','retrying')")
     .all().map(r => [r.id, JSON.parse(r.payload)]));
   const noticeWrite = db.prepare('INSERT INTO notifications VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload');
@@ -114,6 +138,16 @@ export async function startServer({
   const noticeById = db.prepare('SELECT payload FROM notifications WHERE id=?');
   const deliveries = new Map();
   let closing = false, timer, python;
+
+  function findKey(id) {
+    const row = db.prepare('SELECT payload FROM api_keys WHERE id=?').get(textField(id, 'Key ID', 160));
+    if (!row) throw problem(404, 'Key 不存在，请刷新列表');
+    return JSON.parse(row.payload);
+  }
+
+  function sessionCookie(response, token, maxAge) {
+    response.setHeader('Set-Cookie', `anyrouter_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${origin.startsWith('https:') ? '; Secure' : ''}`);
+  }
 
   function findNotice(id) {
     if (!id) return;
@@ -128,11 +162,11 @@ export async function startServer({
     return task;
   }
 
-  async function createPythonTask(input) {
+  async function createPythonTask(input, token) {
     let config;
-    try { config = validateTaskConfig(input.config); }
+    try { config = validateTaskConfig(input); }
     catch (error) { throw problem(400, error.message); }
-    const token = textField(input.token, 'API Key', 256);
+    token = textField(token, 'API Key', 256);
     if (/[\r\n]/.test(token)) throw problem(400, 'API Key 不能包含换行');
     const sessionId = randomUUID(), at = now();
     const request = buildTaskRequest(config, token, { sessionId });
@@ -249,22 +283,92 @@ export async function startServer({
       const healthy = !closing && Boolean(python) && await python.call('health').catch(() => false);
       reply(response, healthy ? 200 : 503, { ok: healthy, modelRequests: ['browser', 'python'], python: healthy }); return;
     }
-    if (authorization && !timingSafeEqual(authDigest, createHash('sha256').update(request.headers.authorization ?? '').digest())) {
-      response.setHeader('WWW-Authenticate', 'Basic realm="AnyRouter", charset="UTF-8"');
-      throw problem(401, '请输入管理密码');
+    const sessionToken = /(?:^|;\s*)anyrouter_session=([A-Za-z0-9_-]{43})(?:;|$)/.exec(request.headers.cookie ?? '')?.[1] ?? '';
+    const sessionId = digest(sessionToken).toString('hex');
+    const authenticated = !password || (sessions.get(sessionId) ?? 0) > now();
+    if (path === '/api/auth/session' && request.method === 'GET') {
+      reply(response, 200, { authenticated, passwordRequired: Boolean(password) }); return;
+    }
+    if (path === '/api/auth/login' && request.method === 'POST') {
+      const input = await jsonBody(request), at = now(), address = request.socket.remoteAddress;
+      for (const [id, expires] of sessions) if (expires <= at) sessions.delete(id);
+      for (const [ip, failure] of loginFailures) if (failure.until <= at) loginFailures.delete(ip);
+      const failure = loginFailures.get(address);
+      if (failure?.count >= 5) {
+        response.setHeader('Retry-After', String(Math.ceil((failure.until - at) / 1000)));
+        throw problem(429, '尝试次数过多，请一分钟后重试');
+      }
+      if (typeof input.password !== 'string' || input.password.length > 1024) throw problem(400, '管理密码格式无效');
+      if (password && !timingSafeEqual(passwordDigest, digest(input.password))) {
+        loginFailures.set(address, { count: (failure?.count ?? 0) + 1, until: failure?.until ?? at + 60_000 });
+        throw problem(401, '管理密码不正确');
+      }
+      loginFailures.delete(address);
+      sessions.delete(sessionId);
+      const token = randomBytes(32).toString('base64url');
+      sessions.set(digest(token).toString('hex'), at + SESSION_SECONDS * 1000);
+      sessionCookie(response, token, SESSION_SECONDS);
+      reply(response, 200, { authenticated: true }); return;
+    }
+    if (path === '/api/auth/logout' && request.method === 'POST') {
+      sessions.delete(sessionId);
+      sessionCookie(response, '', 0);
+      reply(response, 200, { authenticated: false }); return;
+    }
+    const internalNotice = path === '/api/notifications' && request.method === 'POST' &&
+      ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress) &&
+      timingSafeEqual(internalDigest, digest(request.headers.authorization ?? ''));
+    if (path.startsWith('/api/') && !authenticated && !internalNotice) throw problem(401, '请先登录');
+    if (path === '/api/keys') {
+      if (request.method === 'GET') {
+        reply(response, 200, db.prepare('SELECT payload FROM api_keys ORDER BY rowid DESC').all().map(row => JSON.parse(row.payload))); return;
+      }
+      if (request.method === 'POST') {
+        const record = keyRecord(await jsonBody(request));
+        const existing = db.prepare('SELECT payload FROM api_keys WHERE id=?').get(record.id);
+        if (existing) {
+          const saved = JSON.parse(existing.payload);
+          if (saved.value !== record.value) throw problem(409, 'Key ID 已被其他凭据使用');
+          reply(response, 200, saved); return;
+        }
+        db.prepare('INSERT INTO api_keys VALUES (?,?)').run(record.id, JSON.stringify(record));
+        reply(response, 201, record); return;
+      }
+    }
+    const keyPath = path.match(/^\/api\/keys\/([A-Za-z0-9_-]+)$/);
+    if (keyPath) {
+      const record = findKey(keyPath[1]);
+      if (request.method === 'PATCH') {
+        const input = await jsonBody(request);
+        let next;
+        if (input.baseUrl !== undefined && input.auth === undefined) {
+          next = keyRecord({ ...record, baseUrl: input.baseUrl, authStatus: 'checking', models: [], error: undefined, lastAuthenticatedAt: undefined });
+        } else {
+          if (input.baseUrl !== undefined || !input.auth || typeof input.auth.ok !== 'boolean') throw problem(400, 'Key 更新参数无效');
+          if (input.expectedBaseUrl !== record.baseUrl) throw problem(409, 'API 地址已变化，请刷新后重新鉴权');
+          next = keyRecord({ ...record, authStatus: input.auth.ok ? 'ready' : 'error', models: input.auth.models,
+            error: input.auth.ok ? undefined : input.auth.error, lastAuthenticatedAt: input.auth.ok ? now() : record.lastAuthenticatedAt });
+        }
+        db.prepare('UPDATE api_keys SET payload=? WHERE id=?').run(JSON.stringify(next), record.id);
+        reply(response, 200, next); return;
+      }
+      if (request.method === 'DELETE') {
+        for (const task of await python.call('list')) if (task.config.keyId === record.id) await python.call('cancel', { id: task.id });
+        db.prepare('DELETE FROM api_keys WHERE id=?').run(record.id);
+        reply(response, 200, true); return;
+      }
     }
     if (path === '/api/python/models' && request.method === 'POST') {
       const input = await jsonBody(request);
-      const token = textField(input.token, 'API Key', 256);
-      if (/[\r\n]/.test(token)) throw problem(400, 'API Key 不能包含换行');
-      let url;
-      try { url = apiEndpoint(input.baseUrl, 'models'); }
-      catch (error) { throw problem(400, error.message); }
-      reply(response, 200, await python.call('models', { url, token })); return;
+      const key = findKey(input.keyId);
+      reply(response, 200, await python.call('models', { url: apiEndpoint(key.baseUrl, 'models'), token: key.value })); return;
     }
     if (path === '/api/python/tasks') {
       if (request.method === 'GET') { reply(response, 200, (await python.call('list', { detail: url.searchParams.get('detail') })).map(pythonView)); return; }
-      if (request.method === 'POST') { reply(response, 201, pythonView(await createPythonTask(await jsonBody(request)))); return; }
+      if (request.method === 'POST') {
+        const input = await jsonBody(request), key = findKey(input.config?.keyId);
+        reply(response, 201, pythonView(await createPythonTask({ ...input.config, baseUrl: key.baseUrl }, key.value))); return;
+      }
     }
     const pythonTask = path.match(/^\/api\/python\/tasks\/(python_[a-f0-9-]{36})(?:\/(pause|resume|retryNow|cancel|restart))?$/);
     if (pythonTask) {
@@ -273,7 +377,7 @@ export async function startServer({
       if (request.method === 'POST' && action) {
         if (action === 'restart') {
           const source = await python.call('restart', { id });
-          reply(response, 201, await createPythonTask({ config: source.task.config, token: source.request.headers.Authorization.slice(7) }));
+          reply(response, 201, await createPythonTask(source.task.config, source.request.headers.Authorization.slice(7)));
         } else reply(response, 200, await python.call(action, { id }));
         return;
       }
@@ -320,7 +424,7 @@ export async function startServer({
   const boundAddress = server.address().address;
   const localHost = boundAddress === '0.0.0.0' ? '127.0.0.1' : boundAddress === '::' ? '[::1]' :
     boundAddress.includes(':') ? `[${boundAddress}]` : boundAddress;
-  python = new PythonBridge(join(dirname(resolve(dbPath)), 'python-tasks.sqlite'), `http://${localHost}:${server.address().port}/api/notifications`, authorization);
+  python = new PythonBridge(join(dirname(resolve(dbPath)), 'python-tasks.sqlite'), `http://${localHost}:${server.address().port}/api/notifications`, internalAuthorization);
   try { await python.ready; }
   catch (error) { await python.close(); server.closeAllConnections(); await new Promise(resolveClose => server.close(resolveClose)); db.close(); throw error; }
   timer = setInterval(() => void tick(), 1000);

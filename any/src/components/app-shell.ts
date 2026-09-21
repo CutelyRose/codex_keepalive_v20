@@ -1,6 +1,7 @@
 import { LIMITS, MODEL_ID_PATTERN } from '../core/constants';
 import { DEFAULT_API_BASE_URL, normalizeApiBaseUrl } from '../core/api-url';
 import { AppStore } from '../core/store';
+import { serverRequest } from '../core/api-client';
 import {
   getTheme,
   initializeTheme,
@@ -134,6 +135,8 @@ const NAV_ITEMS: Array<{ page: Page; label: string; icon: string }> = [
 ];
 
 export class AppShell extends HTMLElement {
+  initialKeys: KeyRecord[] = [];
+  passwordRequired = false;
   private store!: AppStore;
   private page: Page = 'overview';
   private schedulerFilter: Scheduler | 'all' = 'all';
@@ -171,7 +174,8 @@ export class AppShell extends HTMLElement {
   connectedCallback(): void {
     if (this.store) return;
     initializeTheme();
-    this.store = new AppStore();
+    this.store = new AppStore(this.initialKeys);
+    this.initialKeys = [];
     this.page = this.validPage(window.location.hash.slice(1)) ?? 'overview';
     this.taskDraft = this.makeDraft();
     this.renderShell();
@@ -225,6 +229,7 @@ export class AppShell extends HTMLElement {
               ${this.themeToggleMarkup()}
               <button class="icon-button" type="button" aria-label="查看任务中心" data-nav="tasks">${icon('bell')}</button>
               <button class="avatar-button" type="button" aria-label="打开设置" data-nav="settings">AR</button>
+              ${this.passwordRequired ? `<button class="icon-button" type="button" aria-label="退出登录" title="退出登录" data-action="logout">${icon('logout')}</button>` : ''}
             </div>
           </header>
           <main id="main-content" class="main-content" tabindex="-1">
@@ -357,7 +362,7 @@ export class AppShell extends HTMLElement {
 
   private pageActions(): string {
     if (this.page === 'keys') {
-      return `<button class="button primary" type="button" data-action="open-key-dialog">${icon('plus')} 添加 Key</button>`;
+      return `<div class="key-page-actions"><button class="button secondary" type="button" data-action="refresh-keys">${icon('refresh')} 刷新列表</button><button class="button primary" type="button" data-action="open-key-dialog">${icon('plus')} 添加 Key</button></div>`;
     }
     if (this.page === 'tasks') {
       return `<button class="button primary" type="button" data-nav="create">${icon('plus')} 新建任务</button>`;
@@ -445,7 +450,7 @@ export class AppShell extends HTMLElement {
         <div><span>Key 总数</span><strong>${this.store.keys.length}</strong></div>
         <div><span>鉴权通过</span><strong>${this.store.keys.filter((key) => key.authStatus === 'ready').length}</strong></div>
         <div><span>缓存模型</span><strong>${new Set(this.store.keys.flatMap((key) => key.models)).size}</strong></div>
-        <p><span aria-hidden="true">${icon('key')}</span> 支持多 Key、别名与模型缓存</p>
+        <p><span aria-hidden="true">${icon('database')}</span> 已保存到服务器，可跨设备使用</p>
       </div>
       <section class="surface key-table-wrap" aria-labelledby="key-list-heading">
         <div class="section-head key-list-head"><div><span class="section-kicker">凭据列表</span><h2 id="key-list-heading">API Key</h2></div><span class="muted-text">兼容服务鉴权 · 模型列表</span></div>
@@ -1029,6 +1034,14 @@ export class AppShell extends HTMLElement {
     const taskId = target.dataset.taskId;
     const keyId = target.dataset.keyId;
     switch (action) {
+      case 'logout':
+        await serverRequest('/api/auth/logout', 'POST');
+        window.dispatchEvent(new Event('authentication-required'));
+        break;
+      case 'refresh-keys':
+        await this.store.refreshKeys();
+        this.toast('已同步服务器 Key 列表', 'success');
+        break;
       case 'filter-scheduler': {
         this.schedulerFilter = target.dataset.scheduler as Scheduler | 'all';
         this.selectedTaskIds.clear();
@@ -1057,7 +1070,7 @@ export class AppShell extends HTMLElement {
         this.closeKeyBaseUrlDialog();
         break;
       case 'reauth-key':
-        if (keyId) void this.reauthenticate(keyId);
+        if (keyId) await this.reauthenticate(keyId);
         break;
       case 'delete-key':
         if (keyId && await this.store.deleteKey(keyId)) {
@@ -1339,6 +1352,9 @@ export class AppShell extends HTMLElement {
   private navigate(page: Page, updateHash = true): void {
     if (!PAGE_META[page]) return;
     this.page = page;
+    if (page === 'keys' || page === 'create') {
+      void this.store.refreshKeys().catch(error => this.toast(error instanceof Error ? error.message : 'Key 列表读取失败', 'danger'));
+    }
     if (updateHash && window.location.hash !== `#${page}`) {
       history.pushState(null, '', `#${page}`);
     }
@@ -1464,7 +1480,7 @@ export class AppShell extends HTMLElement {
       case 'overview':
         return { ...meta, subtitle: '查看任务、凭据和模型请求状态。' };
       case 'keys':
-        return { ...meta, subtitle: '管理 API Key、服务地址、鉴权状态与模型列表。' };
+        return { ...meta, subtitle: '凭据统一保存在服务器，登录后可在不同设备使用。' };
       case 'create':
         return { ...meta, subtitle: '配置请求通道、模型、探针和重试参数。' };
       default:
@@ -1518,7 +1534,7 @@ function preferredModel(models: string[], channel: Channel): string {
   return models.find((model) => /claude-(sonnet|opus)-4/.test(model)) ?? models[0]!;
 }
 
-function icon(name: string): string {
+export function icon(name: string): string {
   const paths: Record<string, string> = {
     spark: '<path d="m12 2 1.7 5.2L19 9l-5.3 1.8L12 16l-1.7-5.2L5 9l5.3-1.8L12 2Z"/><path d="m18.5 15 .8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2Z"/>',
     overview: '<rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/>',
@@ -1535,6 +1551,7 @@ function icon(name: string): string {
     moon: '<path d="M20 15.5A8 8 0 1 1 8.5 4 6.5 6.5 0 0 0 20 15.5Z"/>',
     sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
     lock: '<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+    logout: '<path d="M9 4H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h4M9 12h12m-5-5 5 5-5 5"/>',
     refresh: '<path d="M20 6v5h-5M4 18v-5h5"/><path d="M18.2 9A7 7 0 0 0 6.5 6.5L4 9M5.8 15A7 7 0 0 0 17.5 17.5L20 15"/>',
     trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6M14 11v6"/>',
     spinner: '<path d="M21 12a9 9 0 1 1-6.2-8.6"/>',

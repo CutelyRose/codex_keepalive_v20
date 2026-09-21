@@ -1,6 +1,6 @@
 # AnyRouter 双端调度与自动保活
 
-同一页面管理浏览器和 Python 任务，支持双端同时调度、成功后自动保活、ShowDoc / Telegram / Server 酱通知，数据使用 SQLite。Python 任务在关闭页面后继续运行。探活次数与单轮并发不设固定最大值，按填写的正整数执行。
+同一页面管理浏览器和 Python 任务，支持管理密码登录、服务器共享 Key、双端同时调度、成功后自动保活，以及 ShowDoc / Telegram / Server 酱通知。Python 任务在关闭页面后继续运行。探活次数与单轮并发不设固定最大值，按填写的正整数执行。
 
 ## 1Panel 部署
 
@@ -15,7 +15,7 @@ ANYROUTER_ORIGIN=http://实际服务器IP:8787
 ANYROUTER_PASSWORD=替换为随机管理密码
 ```
 
-放行端口后访问上述地址，以 `admin` 登录。完整配置、Compose、更新与备份见 [部署说明](DEPLOY.md)。
+放行端口后访问上述地址，在登录页输入管理密码。Key 保存到服务器 SQLite，登录同一站点即可跨设备使用。完整配置、Compose、更新与备份见 [部署说明](DEPLOY.md)。
 
 ## 开发与文档
 
