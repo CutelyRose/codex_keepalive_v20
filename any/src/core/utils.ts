@@ -1,5 +1,5 @@
 import { LIMITS } from './constants';
-import type { Channel, Task, TaskStatus } from './types';
+import type { Channel, ManagedTask, TaskStatus } from './types';
 
 export function makeId(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
@@ -64,7 +64,7 @@ export function isSchedulableStatus(status: TaskStatus): boolean {
   return status === 'running' || status === 'requesting' || status === 'waiting' || status === 'keepalive';
 }
 
-export function isTaskActive(task: Task): boolean {
+export function isTaskActive(task: ManagedTask): boolean {
   return isSchedulableStatus(task.status) || (task.config.keepalive && task.status === 'accepted-streaming');
 }
 

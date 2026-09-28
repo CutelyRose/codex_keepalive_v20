@@ -2,9 +2,9 @@ import { DEFAULT_SETTINGS, STORAGE_KEYS } from './constants';
 import { AnyRouterGateway } from '../live/anyrouter-gateway';
 import { LiveTaskEngine } from '../live/live-task-engine';
 import { PythonTaskEngine } from '../live/python-task-engine';
-import { validateTaskConfig } from './task-config';
+import { validateTaskConfig, validatePoolTaskConfig } from './task-config';
 import { loadSettings, loadTasks, saveSettings, saveTasks } from './storage';
-import type { AppSettings, KeyRecord, SchedulerChoice, StoreChangeDetail, Task, TaskConfig } from './types';
+import type { AppSettings, KeyRecord, SchedulerChoice, StoreChangeDetail, ManagedTask as Task, ManagedTaskConfig as TaskConfig } from './types';
 import { normalizeApiBaseUrl } from './api-url';
 import { serverRequest } from './api-client';
 
@@ -149,7 +149,16 @@ export class AppStore extends EventTarget {
   resetSettings(): void { this.updateSettings({ ...DEFAULT_SETTINGS }); }
 
   async createTask(config: TaskConfig, scheduler: SchedulerChoice): Promise<Task[]> {
-    const key = this.keys.find((record) => record.id === config.keyId);
+    if ('keyIds' in config) {
+      if (scheduler !== 'python') throw new Error('Key 池仅支持 Python 后台调度');
+      config = validatePoolTaskConfig(config);
+      if (config.keyIds.some(id => !this.keys.some(key => key.id === id && key.authStatus === 'ready'))) {
+        throw new Error('池成员须先通过鉴权');
+      }
+      return [await this.python.create(config)];
+    }
+    const keyId = config.keyId;
+    const key = this.keys.find((record) => record.id === keyId);
     if (!key || key.authStatus !== 'ready') throw new Error('任务对应的 Key 未通过鉴权');
     config = validateTaskConfig({ ...config, baseUrl: key.baseUrl });
     const tasks: Task[] = [];
@@ -162,6 +171,7 @@ export class AppStore extends EventTarget {
     const source = this.engine.get(id);
     if (!source) throw new Error('任务不存在');
     if (source.scheduler === 'python') return this.python.restart(id);
+    if ('keyIds' in source.config) throw new Error('Key 池仅支持 Python 后台调度');
     return this.browser.create({ ...source.config, baseUrl: normalizeApiBaseUrl(source.config.baseUrl) });
   }
 

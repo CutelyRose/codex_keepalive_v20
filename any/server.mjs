@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { PythonBridge } from './python-bridge.mjs';
-import { buildTaskRequest, validateTaskConfig, apiEndpoint, normalizeApiBaseUrl, notificationConfigured,
+import { buildTaskRequest, validateTaskConfig, validatePoolTaskConfig, apiEndpoint, normalizeApiBaseUrl, notificationConfigured,
   validateNotificationSettings, serverchanEndpoint } from './dist/task-requests.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -162,22 +162,48 @@ export async function startServer({
     return task;
   }
 
+  function pythonTaskRecord(config, sessionId) {
+    const at = now();
+    return { id: `python_${randomUUID()}`, scheduler: 'python', sessionId, config, status: 'running',
+      attemptsMade: 0, probeAttempts: 0, successes: 0, healthy: false, startedAt: at, updatedAt: at,
+      responseSummary: '', events: [], notificationStatus: 'not-requested', notificationAttempts: 0,
+      notificationConfigured: notificationConfigured(config) };
+  }
+
+  function pythonRequest(config, token, sessionId) {
+    token = textField(token, 'API Key', 256);
+    if (/[\r\n]/.test(token)) throw problem(400, 'API Key 不能包含换行');
+    const request = buildTaskRequest(config, token, { sessionId });
+    return { url: request.url, headers: Object.fromEntries([...request.headers].map(([key, value]) =>
+      [key.toLowerCase() === 'authorization' ? 'Authorization' : key, value])), body: request.body };
+  }
+
   async function createPythonTask(input, token) {
     let config;
     try { config = validateTaskConfig(input); }
     catch (error) { throw problem(400, error.message); }
-    token = textField(token, 'API Key', 256);
-    if (/[\r\n]/.test(token)) throw problem(400, 'API Key 不能包含换行');
-    const sessionId = randomUUID(), at = now();
-    const request = buildTaskRequest(config, token, { sessionId });
+    const sessionId = randomUUID();
     return python.call('create', {
-      task: { id: `python_${randomUUID()}`, scheduler: 'python', sessionId, config, status: 'running',
-        attemptsMade: 0, probeAttempts: 0, successes: 0, healthy: false, startedAt: at, updatedAt: at,
-        responseSummary: '', events: [], notificationStatus: 'not-requested', notificationAttempts: 0,
-        notificationConfigured: notificationConfigured(config) },
-      request: { url: request.url, headers: Object.fromEntries([...request.headers].map(([key, value]) =>
-        [key.toLowerCase() === 'authorization' ? 'Authorization' : key, value])), body: request.body },
+      task: pythonTaskRecord(config, sessionId), request: pythonRequest(config, token, sessionId),
     });
+  }
+
+  async function createPythonPool(input, saved) {
+    let config;
+    try { config = validatePoolTaskConfig(input); }
+    catch (error) { throw problem(400, error.message); }
+    const keys = saved ?? config.keyIds.map(findKey);
+    if (new Set(keys.map(key => key.value)).size !== keys.length) throw problem(400, 'Key 池不能包含相同凭据');
+    if (!saved && keys.some(key => key.authStatus !== 'ready')) throw problem(400, '池成员须先通过鉴权');
+    const members = keys.map(key => {
+      const sessionId = randomUUID();
+      return { keyId: key.id, alias: key.alias, keyTail: key.value.slice(-4), baseUrl: key.baseUrl, sessionId,
+        attemptsMade: 0, successes: 0, disabled: false,
+        request: pythonRequest({ ...config, baseUrl: key.baseUrl }, key.value, sessionId) };
+    });
+    const task = pythonTaskRecord(config, randomUUID());
+    task.pool = { phase: 'racing', races: 1, members: members.map(({ request, ...member }) => member) };
+    return python.call('create', { task, members: members.map(({ keyId, request }) => ({ keyId, request })) });
   }
 
   function saveNotice(record) {
@@ -353,7 +379,9 @@ export async function startServer({
         reply(response, 200, next); return;
       }
       if (request.method === 'DELETE') {
-        for (const task of await python.call('list')) if (task.config.keyId === record.id) await python.call('cancel', { id: task.id });
+        for (const task of await python.call('list')) {
+          if (task.config.keyId === record.id || task.config.keyIds?.includes(record.id)) await python.call('cancel', { id: task.id });
+        }
         db.prepare('DELETE FROM api_keys WHERE id=?').run(record.id);
         reply(response, 200, true); return;
       }
@@ -366,7 +394,11 @@ export async function startServer({
     if (path === '/api/python/tasks') {
       if (request.method === 'GET') { reply(response, 200, (await python.call('list', { detail: url.searchParams.get('detail') })).map(pythonView)); return; }
       if (request.method === 'POST') {
-        const input = await jsonBody(request), key = findKey(input.config?.keyId);
+        const input = await jsonBody(request);
+        if (input.config && 'keyIds' in input.config) {
+          reply(response, 201, pythonView(await createPythonPool(input.config))); return;
+        }
+        const key = findKey(input.config?.keyId);
         reply(response, 201, pythonView(await createPythonTask({ ...input.config, baseUrl: key.baseUrl }, key.value))); return;
       }
     }
@@ -377,6 +409,11 @@ export async function startServer({
       if (request.method === 'POST' && action) {
         if (action === 'restart') {
           const source = await python.call('restart', { id });
+          if (source.task.pool) {
+            const keys = source.task.pool.members.map(member => ({ id: member.keyId, alias: member.alias, baseUrl: member.baseUrl,
+              value: source.members.find(item => item.keyId === member.keyId).request.headers.Authorization.slice(7) }));
+            reply(response, 201, pythonView(await createPythonPool(source.task.config, keys))); return;
+          }
           reply(response, 201, await createPythonTask(source.task.config, source.request.headers.Authorization.slice(7)));
         } else reply(response, 200, await python.call(action, { id }));
         return;

@@ -7,13 +7,10 @@ import json
 import os
 from pathlib import Path
 import queue
-import socket
 import sqlite3
-import ssl
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
 import uuid
 
@@ -22,61 +19,12 @@ import codex_poll as poll
 from codex_memory import IS_WINDOWS, _dpapi
 from codex_tasks import Runtime, make_spec
 
-TLS_CONTEXT = ssl.create_default_context()
+from python_transport import Lane, request_stream
+from python_pool import KeyPool
 
 
 def now_ms():
     return round(time.time() * 1000)
-
-
-def compact(value, limit=8192):
-    raw = value.encode('utf-8')
-    return value if len(raw) <= limit else raw[:limit - 3].decode('utf-8', errors='ignore') + '…'
-
-
-def retryable(detail, status=None):
-    import re
-    if re.search(r'insufficient_quota|quota exceeded|insufficient credit|credit balance|billing limit|额度不足|配额不足|余额不足|invalid[ _](?:token|api[ _]key|request)|authentication_error|permission_error|not_found_error|unauthorized|令牌无效|无效的令牌|model_not_found', detail, re.I):
-        return False
-    return status is None or status in (408, 409, 425, 429, 500, 502, 503, 504, 529)
-
-
-class Lane(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
-    def __init__(self):
-        super().__init__(context=TLS_CONTEXT)
-        self.cancelled = threading.Event()
-        self.sock = None
-        self.summary = ''
-
-    def do_open(self, http_class, req, **kwargs):
-        lane = self
-        deadline = time.monotonic() + req.timeout
-
-        class Connection(http_class):
-            def connect(self):
-                if lane.cancelled.is_set():
-                    raise InterruptedError('任务已停止')
-                super().connect()
-                lane.sock = self.sock
-                if lane.cancelled.is_set():
-                    raise InterruptedError('任务已停止')
-
-            def getresponse(self):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError('等待成功首事件超时')
-                self.sock.settimeout(remaining)
-                return super().getresponse()
-
-        return super().do_open(Connection, req, **kwargs)
-
-    def cancel(self):
-        self.cancelled.set()
-        if self.sock:
-            try:
-                self.sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
 
 
 class WebRuntime(Runtime):
@@ -86,6 +34,7 @@ class WebRuntime(Runtime):
         self.notification_url = notification_url
         self.entries = {}
         self.rounds = {}
+        self.pools = {}
         self.closing = False
         common = argparse.Namespace(count=0, start_paused=False)
         super().__init__(poll, common, {'version': 1, 'concurrency': 8, 'tasks': []}, [], request=self.request_round)
@@ -123,17 +72,20 @@ class WebRuntime(Runtime):
         with self.lock:
             if len(self.tasks) >= 128:
                 raise ValueError('Python 端最多保存 128 个任务')
-            data, request = entry['task'], entry['request']
+            data = entry['task']
+            is_pool = 'pool' in data
+            requests = [m['request'] for m in entry['members']] if is_pool else [entry['request']]
+            request = requests[0]
             if data['id'] in self.entries:
                 raise ValueError('任务 ID 重复')
             config = data['config']
             key = request['headers']['Authorization'].removeprefix('Bearer ')
             args = argparse.Namespace(
-                mode='api', base_url=config['baseUrl'], api_key=key, model=config['model'], api_style='responses',
+                mode='api', base_url=data['pool']['members'][0]['baseUrl'] if is_pool else config['baseUrl'], api_key=key, model=config['model'], api_style='responses',
                 stream=True, interval=config['intervalSeconds'], success_interval=config['keepaliveMinSeconds'],
                 success_interval_max=config['keepaliveMaxSeconds'], timeout=600., max_inflight=1, max_tokens=128,
                 tool_mode='off', token_param='auto', reset_session_on_400=False, prompts=[config['prompt']],
-                extra_headers={}, query_params={}, secrets=[key, config['telegramBotToken'], config.get('serverchanSendKey', ''),
+                extra_headers={}, query_params={}, secrets=[*[r['headers']['Authorization'].removeprefix('Bearer ') for r in requests], config['telegramBotToken'], config.get('serverchanSendKey', ''),
                     config.get('showdocPushUrl', ''), config.get('showdocPushUrl', '').rsplit('/', 1)[-1]],
                 display_endpoint=request['url'], api_name=config['name'], web_config=config, web_request=request,
             )
@@ -146,7 +98,9 @@ class WebRuntime(Runtime):
             task.session_id = data['sessionId']
             task.sessions[task.key] = task.session_id
             task.status = 200 if data['healthy'] else None
-            if restore:
+            if is_pool:
+                self.pools[task.id] = KeyPool(self, task, entry, restore)
+            if restore and not is_pool:
                 if active:
                     if not data['healthy'] and data['probeAttempts'] >= config['maxAttempts']:
                         task.paused, task.spec['enabled'] = True, False
@@ -170,7 +124,15 @@ class WebRuntime(Runtime):
                 'events': list(source['events']) if details or private else [],
                 'responseSummary': source['responseSummary'] if details or private else ''}
         task = self.find(task_id)
-        if task and data['status'] in ('running', 'waiting', 'keepalive') and not task.paused:
+        if task_id in self.pools:
+            pool = self.pools[task_id]
+            data['pool'] = pool.view()
+            due = [pool.due[key] for key in pool.eligible() if key not in pool.active]
+            if due and not task.paused:
+                data['nextAttemptAt'] = pool.wall(min(due))
+            else:
+                data.pop('nextAttemptAt', None)
+        elif task and data['status'] in ('running', 'waiting', 'keepalive') and not task.paused:
             data['nextAttemptAt'] = round((self.epoch + task.next_due) * 1000)
         else:
             data.pop('nextAttemptAt', None)
@@ -225,6 +187,12 @@ class WebRuntime(Runtime):
             elif method in ('resume', 'retryNow'):
                 if data['status'] not in ('paused', 'waiting', 'keepalive'):
                     return False
+                if task_id in self.pools:
+                    self.pools[task_id].resume()
+                    self.event(task_id, 'task.resumed', '池任务已继续')
+                    self.save(task_id)
+                    self.wake.set()
+                    return True
                 if not data['healthy'] and data['probeAttempts'] >= data['config']['maxAttempts']:
                     raise ValueError('探活次数已耗尽，请重新开始任务')
                 self.abort_task(task_id)
@@ -239,8 +207,21 @@ class WebRuntime(Runtime):
             return True
 
     def abort_task(self, task_id):
+        if task_id in self.pools:
+            self.pools[task_id].stop()
         for lane in self.rounds.get(task_id, []):
             lane.cancel()
+
+    def scheduled_externally(self, task):
+        return task.id in self.pools
+
+    def step(self):
+        with self.lock:
+            for task_id, pool in list(self.pools.items()):
+                pool.tick()
+                if self.find(task_id) is None and not pool.physical:
+                    del self.pools[task_id]
+            super().step()
 
     def current(self, task_id, revision):
         task = self.find(task_id)
@@ -281,118 +262,40 @@ class WebRuntime(Runtime):
         return result
 
     def request_lane(self, args, job, revision, lane, lanes, winner, completed):
-        config, request = args.web_config, args.web_request
-        response = None
-        outcome = {'accepted': False, 'retryable': True}
-        started, last_data = self.clock(), self.clock()
-        try:
-            headers = dict(request['headers'])
-            if config['channel'] == 'gpt':
-                headers['x-client-request-id'] = str(uuid.uuid4())
-            req = urllib.request.Request(request['url'], data=request['body'].encode('utf-8'), headers=headers)
-            try:
-                response = urllib.request.build_opener(poll.NoRedirect(), lane).open(req, timeout=config['timeoutSeconds'])
-            except urllib.error.HTTPError as exc:
-                response = exc
-            if response.status != 200:
-                raw = response.read(8192).decode('utf-8', errors='replace')
-                outcome.update(status=response.status, error=f'HTTP {response.status} · {raw[:500]}', retryable=retryable(raw, response.status))
-                retry_after = response.headers.get('Retry-After')
-                if retry_after:
-                    from email.utils import parsedate_to_datetime
-                    try:
-                        outcome['retryAfter'] = max(0, float(retry_after))
-                    except ValueError:
-                        try:
-                            outcome['retryAfter'] = max(0, parsedate_to_datetime(retry_after).timestamp() - time.time())
-                        except (ValueError, TypeError, OverflowError):
-                            pass
-                return
-            buffer, data_lines, event_type, size = b'', [], '', 0
-            last_data = self.clock()
-
-            def event():
-                nonlocal event_type
-                raw = '\n'.join(data_lines)
-                data_lines.clear()
-                kind, event_type = event_type, ''
-                if not raw:
-                    return
-                try:
-                    payload = json.loads(raw)
-                except ValueError:
-                    payload = {}
-                if kind in ('', 'message'):
-                    kind = payload.get('type', 'message') if isinstance(payload, dict) else 'message'
-                lane.summary = compact(lane.summary + f'event: {kind}\ndata: {raw}\n\n')
-                accepted = kind in (('response.created', 'response.in_progress') if config['channel'] == 'gpt' else ('message_start',))
-                with self.lock:
-                    if not self.current(job.task_id, revision) or lane.cancelled.is_set():
-                        raise InterruptedError('任务已停止')
-                    task_data = self.entries[job.task_id]['task']
-                    if accepted and not winner:
-                        winner.append(lane)
-                        outcome['accepted'] = True
-                        for sibling in lanes:
-                            if sibling is not lane:
-                                sibling.cancel()
-                        notify = not task_data['healthy'] and now_ms() - task_data.get('lastNotifiedAt', 0) >= 300_000
-                        task_data.update(status='accepted-streaming', healthy=True, probeAttempts=0,
-                                         acceptedAt=now_ms(), successes=task_data['successes'] + 1)
-                        task_data.pop('lastError', None)
-                        self.event(job.task_id, kind, '已成功挤入', '成功后自动保活。' if config['keepalive'] else '成功后结束任务。', 'success')
-                        if notify and task_data['notificationConfigured']:
-                            task_data['lastNotifiedAt'] = now_ms()
-                            task_data['notificationStatus'] = 'queued'
-                            threading.Thread(target=self.notify_task, args=(job.task_id, revision), daemon=True).start()
-                        self.save(job.task_id)
-                    if len(lanes) == 1 or winner == [lane]:
-                        task_data['responseSummary'] = poll.redact(lane.summary, args.secrets)
-                    if kind in ('error', 'response.failed'):
-                        raise ValueError(raw[:500])
-
-            while not response.isclosed():
-                elapsed = self.clock() - started
-                remaining = min(600 - elapsed, 60 - (self.clock() - last_data))
-                if not outcome['accepted']:
-                    remaining = min(remaining, config['timeoutSeconds'] - elapsed)
-                if lane.cancelled.is_set():
+        def on_event(kind, raw, accepted):
+            with self.lock:
+                if not self.current(job.task_id, revision) or lane.cancelled.is_set():
                     raise InterruptedError('任务已停止')
-                if remaining <= 0:
-                    raise TimeoutError('响应流超过超时时限')
-                lane.sock.settimeout(remaining)
-                chunk = response.read1(65536)
-                if not chunk:
-                    break
-                last_data = self.clock()
-                size += len(chunk)
-                if size > 2 * 1024 * 1024:
-                    outcome['retryable'] = False
-                    raise ValueError('SSE 响应超过 2 MiB 大小限制')
-                buffer += chunk
-                while b'\n' in buffer:
-                    line, buffer = buffer.split(b'\n', 1)
-                    line = line.rstrip(b'\r').decode('utf-8', errors='replace')
-                    if not line:
-                        event()
-                    elif line.startswith('data:'):
-                        data_lines.append(line[5:].removeprefix(' '))
-                    elif line.startswith('event:'):
-                        event_type = line[6:].strip()
-            if buffer.startswith(b'data:'):
-                data_lines.append(buffer[5:].strip().decode('utf-8', errors='replace'))
-            event()
-            if not outcome['accepted']:
-                outcome['error'] = 'SSE 流结束但未收到成功信号'
-        except Exception as exc:
-            outcome['error'] = poll.redact(str(exc) or type(exc).__name__, args.secrets)
-            outcome['retryable'] = outcome['retryable'] and retryable(outcome['error'])
-            outcome['interrupted'] = outcome['accepted']
-        finally:
-            if response is not None:
-                response.close()
-            outcome['summary'] = poll.redact(lane.summary, args.secrets)
-            completed.put(outcome)
+                task_data = self.entries[job.task_id]['task']
+                if accepted and not winner:
+                    winner.append(lane)
+                    for sibling in lanes:
+                        if sibling is not lane:
+                            sibling.cancel()
+                    self.accepted(self.find(job.task_id), kind)
+                if len(lanes) == 1 or winner == [lane]:
+                    task_data['responseSummary'] = poll.redact(lane.summary, args.secrets)
+
+                return winner == [lane]
+        completed.put(request_stream(args.web_config, args.web_request, lane, args.secrets, self.clock, on_event))
+
+    def accepted(self, task, kind, member=None):
+        data = self.entries[task.id]['task']
+        notify = not data['healthy'] and now_ms() - data.get('lastNotifiedAt', 0) >= 300_000
+        data.update(status='accepted-streaming', healthy=True, probeAttempts=0,
+                    acceptedAt=now_ms(), successes=data['successes'] + 1)
+        data.pop('lastError', None)
+        detail = f'{member["alias"]} · 尾号 {member["keyTail"]} 独自保活。' if member else '成功后自动保活。' if data['config']['keepalive'] else '成功后结束任务。'
+        self.event(task.id, kind, '已成功挤入', detail, 'success')
+        if notify and data['notificationConfigured']:
+            data['lastNotifiedAt'] = now_ms()
+            data['notificationStatus'] = 'queued'
+            snapshot = self.view(task.id, private=True, details=False)
+            if member:
+                snapshot['config']['name'] += f' · {member["alias"]}'
+            key_tail = member['keyTail'] if member else task.args.api_key[-4:]
+            threading.Thread(target=self.notify_task, args=(task.id, task.revision, snapshot, key_tail), daemon=True).start()
+        self.save(task.id)
 
     def _emit(self, task, result):
         # Web events are stored on entries; terminal records duplicate unused response history.
@@ -433,15 +336,10 @@ class WebRuntime(Runtime):
             self.event(task.id, 'request.failed', '错误停止' if data['status'] == 'exhausted' else '等待重新探活', data['lastError'], 'warning')
         self.save(task.id)
 
-    def notify_task(self, task_id, revision):
-        with self.lock:
-            if not self.current(task_id, revision):
-                return
-            data = self.view(task_id, private=True, details=False)
-            key = self.find(task_id).args.api_key
+    def notify_task(self, task_id, revision, data, key_tail):
         config = data['config']
         payload = {'taskId': f'{task_id}:{data["acceptedAt"]}', 'taskName': config['name'], 'channel': config['channel'],
-                   'model': config['model'], 'keyTail': key[-4:], 'attempts': data['attemptsMade'],
+                   'model': config['model'], 'keyTail': key_tail, 'attempts': data['attemptsMade'],
                    'elapsedMs': data['acceptedAt'] - data['startedAt'], 'acceptedAt': data['acceptedAt'],
                    'chatId': config['telegramChatId'], 'botToken': config['telegramBotToken'],
                    'showdocUrl': config.get('showdocPushUrl', ''),
@@ -454,13 +352,13 @@ class WebRuntime(Runtime):
             with urllib.request.build_opener(urllib.request.ProxyHandler({}), poll.NoRedirect()).open(req, timeout=20) as response:
                 receipt = json.loads(response.read(16384))
             with self.lock:
-                if self.current(task_id, revision):
+                if self.current(task_id, revision) and self.entries[task_id]['task']['acceptedAt'] == data['acceptedAt']:
                     current = self.entries[task_id]['task']
                     current.update(notificationId=receipt['id'], notificationStatus=receipt['status'], notificationAttempts=receipt['attempts'])
                     self.save(task_id)
         except Exception as exc:
             with self.lock:
-                if self.current(task_id, revision):
+                if self.current(task_id, revision) and self.entries[task_id]['task']['acceptedAt'] == data['acceptedAt']:
                     self.entries[task_id]['task']['notificationStatus'] = 'dead'
                     self.event(task_id, 'notification.dead', '通知提交失败', str(exc), 'warning')
                     self.save(task_id)

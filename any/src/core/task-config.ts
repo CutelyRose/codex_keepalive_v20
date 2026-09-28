@@ -1,6 +1,6 @@
 import { LIMITS, MODEL_ID_PATTERN } from './constants';
 import { normalizeApiBaseUrl } from './api-url';
-import type { NotificationSettings, TaskConfig } from './types';
+import type { ManagedTaskConfig, NotificationSettings, PoolTaskConfig, TaskConfig } from './types';
 
 export function showdocEndpoint(pushUrl: string): string {
   if (!/^https:\/\/push\.showdoc\.com\.cn\/server\/api\/push\/[A-Za-z0-9_-]+$/.test(pushUrl)) {
@@ -43,15 +43,16 @@ export function validateNotificationSettings(input: NotificationSettings): Notif
   return config;
 }
 
-export function validateTaskConfig(input: TaskConfig): TaskConfig {
+function text(value: unknown, label: string, max: number): string {
+  if (typeof value !== 'string' || !value.trim() || value.length > max) throw new Error(`${label}不能为空或超长`);
+  return value.trim();
+}
+
+function validateCommon<T extends ManagedTaskConfig>(input: T): T {
   if (!input || typeof input !== 'object') throw new Error('任务配置无效');
-  const text = (value: unknown, label: string, max: number): string => {
-    if (typeof value !== 'string' || !value.trim() || value.length > max) throw new Error(`${label}不能为空或超长`);
-    return value.trim();
-  };
   if (input.channel !== 'gpt' && input.channel !== 'claude') throw new Error('请求通道无效');
   const numbers = {
-    maxAttempts: 'attempts', concurrency: 'concurrency', intervalSeconds: 'intervalSeconds',
+    concurrency: 'concurrency', intervalSeconds: 'intervalSeconds',
     timeoutSeconds: 'timeoutSeconds', keepaliveMinSeconds: 'keepaliveMinSeconds',
     keepaliveMaxSeconds: 'keepaliveMaxSeconds',
   } as const;
@@ -68,8 +69,25 @@ export function validateTaskConfig(input: TaskConfig): TaskConfig {
   const model = text(input.model, '模型', 160);
   if (!new RegExp(`^(?:${MODEL_ID_PATTERN})+$`).test(model)) throw new Error('模型 ID 格式无效');
   return {
-    ...input, name: text(input.name, '任务名称', 80), keyId: text(input.keyId, 'Key ID', 100),
-    prompt: text(input.prompt, '提示词', 1000), model, baseUrl: normalizeApiBaseUrl(input.baseUrl),
+    ...input, name: text(input.name, '任务名称', 80),
+    prompt: text(input.prompt, '提示词', 1000), model,
     ...validateNotificationSettings(input),
   };
+}
+
+export function validateTaskConfig(input: TaskConfig): TaskConfig {
+  const config = validateCommon(input);
+  if ('keyIds' in config) throw new Error('Key 池只能通过 Python 池任务运行');
+  if (!Number.isSafeInteger(config.maxAttempts) || config.maxAttempts < 1) throw new Error('maxAttempts 超出范围');
+  return { ...config, keyId: text(config.keyId, 'Key ID', 100), baseUrl: normalizeApiBaseUrl(config.baseUrl) };
+}
+
+export function validatePoolTaskConfig(input: PoolTaskConfig): PoolTaskConfig {
+  const config = validateCommon(input);
+  if (!Array.isArray(config.keyIds) || config.keyIds.length < 2) throw new Error('Key 池至少选择两个不同的 Key');
+  const keyIds = config.keyIds.map(id => text(id, 'Key ID', 100));
+  if (new Set(keyIds).size !== keyIds.length) throw new Error('Key 池不能包含重复成员');
+  if (!config.keepalive) throw new Error('Key 池必须开启保活');
+  if ('keyId' in config || 'baseUrl' in config || 'maxAttempts' in config) throw new Error('Key 池不接受单 Key 地址或探活次数上限');
+  return { ...config, keyIds, keepalive: true };
 }

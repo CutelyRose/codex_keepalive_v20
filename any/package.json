@@ -12,7 +12,7 @@
     "prestart": "npm run build",
     "start": "node server.mjs",
     "pretest": "npm run build",
-    "test": "node --test tests/local.test.mjs"
+    "test": "node --test tests/local.test.mjs tests/pool.test.mjs"
   },
   "devDependencies": {
     "esbuild": "0.28.2",

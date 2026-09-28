@@ -16,8 +16,8 @@ import type {
   NotificationSettings,
   Scheduler,
   SchedulerChoice,
-  Task,
-  TaskConfig,
+  ManagedTask as Task,
+  ManagedTaskConfig as TaskConfig,
   TaskStatus,
 } from '../core/types';
 import {
@@ -37,6 +37,9 @@ type Page = 'overview' | 'keys' | 'create' | 'tasks' | 'settings';
 type NotificationProvider = 'showdoc' | 'serverchan' | 'telegram';
 
 interface TaskDraft extends NotificationSettings {
+  pool: boolean;
+  keyIds: string[];
+  keyQuery: string;
   notificationProvider: NotificationProvider;
   scheduler: SchedulerChoice;
   name: string;
@@ -120,6 +123,12 @@ function notificationMeta(task: Task): { label: string; tone: string } {
 }
 
 function taskStatusMeta(task: Task): { label: string; tone: string; description: string } {
+  if (task.pool && isTaskActive(task)) {
+    const member = task.pool.members.find(item => item.keyId === task.pool?.activeKeyId);
+    if (task.pool.phase === 'recovering') return { label: '单号恢复', tone: 'amber', description: `${member?.alias ?? '原保活号'} · 30 秒内独自重试` };
+    if (task.pool.phase === 'keeping') return { label: '单号保活', tone: 'green', description: `${member?.alias ?? ''} · 尾号 ${member?.keyTail ?? ''}` };
+    return { label: '全池挤入', tone: 'blue', description: `${task.pool.members.filter(item => !item.disabled).length} 个可用 Key 持续竞争` };
+  }
   if (task.status === 'requesting' && task.healthy) return { label: '保活请求中', tone: 'green', description: '正在确认连接可用' };
   return task.stopReason === 'permanent-error'
     ? { label: '错误停止', tone: 'red', description: '请修正凭据、额度或配置后重新开始' }
@@ -476,16 +485,48 @@ export class AppShell extends HTMLElement {
         <div class="row-actions">
           <button class="icon-button" type="button" data-action="edit-key-base-url" data-key-id="${key.id}" aria-label="修改 ${escapeHtml(key.alias)} 的 API 地址">${icon('settings')}</button>
           <button class="button tiny secondary" type="button" data-action="reauth-key" data-key-id="${key.id}" ${key.authStatus === 'checking' ? 'disabled' : ''}>${icon('refresh')} 重新鉴权</button>
-          <button class="icon-button danger-ghost" type="button" data-action="delete-key" data-key-id="${key.id}" aria-label="删除 ${escapeHtml(key.alias)}">${icon('trash')}</button>
+          <button class="icon-button danger-ghost" type="button" data-action="delete-key" data-key-id="${key.id}" title="删除 Key 会取消关联任务及整个关联池" aria-label="删除 ${escapeHtml(key.alias)}，并取消关联任务及池">${icon('trash')}</button>
         </div>
       </article>
     `;
   }
 
+  private draftModels(): string[] {
+    const keys = this.taskDraft.pool
+      ? this.store.keys.filter(key => this.taskDraft.keyIds.includes(key.id))
+      : this.store.keys.filter(key => key.id === this.taskDraft.keyId);
+    if (!keys.length) return [];
+    return modelsForChannel(keys[0].models, this.taskDraft.channel).filter(model => keys.every(key => key.models.includes(model)));
+  }
+
+  private concurrencySummary(): string {
+    const count = this.taskDraft.concurrency || 0;
+    return this.taskDraft.pool ? `${this.taskDraft.keyIds.length} × ${count} = ${this.taskDraft.keyIds.length * count} 个请求` : `${count} 线程`;
+  }
+
+  private poolKeyMarkup(): string {
+    return `<fieldset class="pool-key-picker"><legend>池成员 · 已选 ${this.taskDraft.keyIds.length} 个 Key</legend>
+      <label class="field"><span>搜索 Key 别名或尾号</span><input type="search" name="keyQuery" value="${escapeHtml(this.taskDraft.keyQuery)}" aria-describedby="pool-key-error"></label>
+      <div class="pool-key-actions"><button type="button" class="text-button" data-action="select-pool-keys">全选可用 Key</button><button type="button" class="text-button" data-action="clear-pool-keys">清空选择</button></div>
+      <div class="pool-key-list">${this.store.keys.map(key => {
+        const search = `${key.alias} ${keyTail(key.value)}`.toLowerCase();
+        return `<label class="pool-key-option" data-pool-key-search="${escapeHtml(search)}" ${search.includes(this.taskDraft.keyQuery.toLowerCase().trim()) ? '' : 'hidden'}><input type="checkbox" name="poolKeyIds" value="${escapeHtml(key.id)}" ${this.taskDraft.keyIds.includes(key.id) ? 'checked' : ''} ${key.authStatus === 'ready' ? '' : 'disabled'}><span><strong>${escapeHtml(key.alias)} · ${escapeHtml(keyTail(key.value))}</strong><small>${escapeHtml(key.baseUrl)}${key.authStatus === 'ready' ? '' : ' · 请先通过 Python 鉴权'}</small></span></label>`;
+      }).join('')}</div><p id="pool-key-error" class="pool-error" role="alert"></p></fieldset>`;
+  }
+
+  private poolDetailMarkup(task: Task): string {
+    if (!task.pool) return '';
+    const labels = { racing: '挤入中', keeping: '保活', recovering: '恢复中', standby: '待命', disabled: '不可用', paused: '已停止' };
+    return `<section class="drawer-section"><h3>池成员 · 第 ${task.pool.races} 次竞争</h3><p role="status" aria-atomic="true">${escapeHtml(taskStatusMeta(task).description)}</p>
+      <p>${task.pool.recoveryDeadline ? '全池重试倒计时' : '下次请求'}：<strong data-countdown-task="${task.id}">—</strong></p>
+      <div class="pool-member-list">${task.pool.members.map(member => `<article class="pool-member"><div><strong>${escapeHtml(member.alias)} · ${escapeHtml(member.keyTail)}</strong><span>${labels[member.status]}</span></div><small>${escapeHtml(member.baseUrl)} · 请求 ${member.attemptsMade} / 成功 ${member.successes}</small><small>会话 ${escapeHtml(member.sessionId)}</small>${member.lastError ? `<p>${escapeHtml(member.lastError)}</p>` : ''}</article>`).join('')}</div></section>`;
+  }
+
   private createMarkup(): string {
     this.ensureDraft();
     const key = this.store.keys.find((item) => item.id === this.taskDraft.keyId);
-    const channelModels = key ? modelsForChannel(key.models, this.taskDraft.channel) : [];
+    const channelModels = this.draftModels();
+    const pool = this.taskDraft.pool;
     const hasReadyKey = this.store.keys.some((item) => item.authStatus === 'ready');
     if (!hasReadyKey) {
       return `
@@ -502,7 +543,8 @@ export class AppShell extends HTMLElement {
         <div class="form-main">
           <section class="surface form-section" aria-labelledby="channel-heading">
             <div class="form-section-head"><span class="step-number">01</span><div><h2 id="channel-heading">选择请求通道</h2><p>GPT 使用 Responses API，Claude Code 使用 Messages API。</p></div></div>
-            <label class="field scheduler-field"><span>调度端</span><select name="scheduler" aria-label="任务调度端">${(['browser', 'python', 'both'] as const).map(mode => `<option value="${mode}" ${this.taskDraft.scheduler === mode ? 'selected' : ''}>${mode === 'browser' ? '浏览器调度' : mode === 'python' ? 'Python 调度' : '双端同时调度'}</option>`).join('')}</select><small>双端会各创建一个独立任务，使用同一份参数，分别发起请求和计费。</small></label>
+            <label class="field"><span>任务类型</span><select name="taskKind"><option value="single" ${!pool ? 'selected' : ''}>普通任务</option><option value="pool" ${pool ? 'selected' : ''}>Key 池任务</option></select></label>
+            ${pool ? '<input type="hidden" name="scheduler" value="python"><p class="field-help">Python 后台运行，关闭网页继续。全池竞争，只保留一个保活号。</p>' : `<label class="field scheduler-field"><span>调度端</span><select name="scheduler" aria-label="任务调度端">${(['browser', 'python', 'both'] as const).map(mode => `<option value="${mode}" ${this.taskDraft.scheduler === mode ? 'selected' : ''}>${mode === 'browser' ? '浏览器调度' : mode === 'python' ? 'Python 调度' : '双端同时调度'}</option>`).join('')}</select><small>双端会各创建一个独立任务，使用同一份参数，分别发起请求和计费。</small></label>`}
             <div class="channel-selector" role="radiogroup" aria-label="请求通道">
               ${channelOption('gpt', 'GPT 通用', 'Responses API', 'response.created', this.taskDraft.channel)}
               ${channelOption('claude', 'Claude Code', 'Messages API', 'message_start', this.taskDraft.channel)}
@@ -512,10 +554,10 @@ export class AppShell extends HTMLElement {
           <section class="surface form-section" aria-labelledby="model-heading">
             <div class="form-section-head"><span class="step-number">02</span><div><h2 id="model-heading">凭据与模型</h2><p>从鉴权结果中选择 Key 和模型，也可填写自定义模型 ID。</p></div></div>
             <div class="field-grid two-cols">
-              <label class="field"><span>Key</span><select name="keyId" required>${this.store.keys.map((item) => `<option value="${item.id}" ${item.id === this.taskDraft.keyId ? 'selected' : ''} ${item.authStatus !== 'ready' ? 'disabled' : ''}>${escapeHtml(item.alias)} · ${escapeHtml(keyTail(item.value))}${item.authStatus !== 'ready' ? '（不可用）' : ''}</option>`).join('')}</select></label>
+              ${pool ? this.poolKeyMarkup() : `<label class="field"><span>Key</span><select name="keyId" required>${this.store.keys.map((item) => `<option value="${item.id}" ${item.id === this.taskDraft.keyId ? 'selected' : ''} ${item.authStatus !== 'ready' ? 'disabled' : ''}>${escapeHtml(item.alias)} · ${escapeHtml(keyTail(item.value))}${item.authStatus !== 'ready' ? '（不可用）' : ''}</option>`).join('')}</select></label>`}
               <label class="field"><span>模型</span><select name="modelChoice" required>${modelOptions}<option value="__custom__" ${this.taskDraft.modelChoice === '__custom__' ? 'selected' : ''}>自定义模型 ID…</option></select></label>
             </div>
-            <div class="info-banner compact service-banner"><span aria-hidden="true">${icon('pulse')}</span><p><strong>API 服务</strong> ${escapeHtml(key?.baseUrl ?? '—')}</p></div>
+            <div class="info-banner compact service-banner"><span aria-hidden="true">${icon('pulse')}</span><p><strong>API 服务</strong> ${pool ? '各成员使用自己的服务地址' : escapeHtml(key?.baseUrl ?? '—')}</p></div>
             ${this.taskDraft.modelChoice === '__custom__' ? `<label class="field custom-model-field"><span>自定义模型 ID</span><input name="customModel" value="${escapeHtml(this.taskDraft.customModel)}" pattern="${MODEL_ID_PATTERN}" maxlength="100" placeholder="${this.taskDraft.channel === 'gpt' ? 'gpt-custom-model' : 'claude-custom-model'}" required /><small>模型 ID 将按原样发送到对应通道。</small></label>` : ''}
             ${this.taskDraft.channel === 'claude' ? `
               <label class="switch-row">
@@ -531,13 +573,13 @@ export class AppShell extends HTMLElement {
             <label class="field"><span>任务名称</span><input name="name" value="${escapeHtml(this.taskDraft.name)}" maxlength="60" required /></label>
             <label class="field"><span>探针提示词</span><textarea name="prompt" rows="3" maxlength="1000" required>${escapeHtml(this.taskDraft.prompt)}</textarea><small>默认只要求返回 OK，以降低探针开销。</small></label>
             <div class="field-grid two-cols">
-              ${numberField('maxAttempts', '每轮探活上限', this.taskDraft.maxAttempts, LIMITS.attempts.min, undefined, 1, '次')}
-              ${numberField('concurrency', '并发线程', this.taskDraft.concurrency, LIMITS.concurrency.min, undefined, 1, '线程')}
+              ${pool ? '<p class="field-help">持续重试，直到成功或手动停止。</p>' : numberField('maxAttempts', '每轮探活上限', this.taskDraft.maxAttempts, LIMITS.attempts.min, undefined, 1, '次')}
+              ${numberField('concurrency', pool ? '每个 Key 的探活并发' : '并发线程', this.taskDraft.concurrency, LIMITS.concurrency.min, undefined, 1, '线程')}
               ${numberField('intervalSeconds', '请求间隔', this.taskDraft.intervalSeconds, LIMITS.intervalSeconds.min, LIMITS.intervalSeconds.max, 0.5, '秒')}
               ${numberField('timeoutSeconds', '首事件超时', this.taskDraft.timeoutSeconds, LIMITS.timeoutSeconds.min, LIMITS.timeoutSeconds.max, 1, '秒')}
             </div>
-            <p class="field-help">探活按实际并发请求计数；成功后重置探活预算。保活每次发送一个请求，失败后按探活策略恢复。</p>
-            <label class="switch-row"><span class="switch-control"><input type="checkbox" name="keepalive" ${this.taskDraft.keepalive ? 'checked' : ''} /><span class="switch-ui" aria-hidden="true"></span></span><span><strong>成功后自动保活</strong><small>关闭后，任务在首次成功时结束。</small></span></label>
+            <p class="field-help">${pool ? '首个成功 Key 独自保活；失败或异常断流后独自恢复 30 秒，超时全池再挤。' : '探活按实际并发请求计数；成功后重置探活预算。保活每次发送一个请求，失败后按探活策略恢复。'}</p>
+            ${pool ? '<input type="hidden" name="keepalive" value="on">' : `<label class="switch-row"><span class="switch-control"><input type="checkbox" name="keepalive" ${this.taskDraft.keepalive ? 'checked' : ''} /><span class="switch-ui" aria-hidden="true"></span></span><span><strong>成功后自动保活</strong><small>关闭后，任务在首次成功时结束。</small></span></label>`}
             <div class="field-grid two-cols">
               ${numberField('keepaliveMinSeconds', '保活最短间隔', this.taskDraft.keepaliveMinSeconds, LIMITS.keepaliveMinSeconds.min, LIMITS.keepaliveMinSeconds.max, 0.5, '秒')}
               ${numberField('keepaliveMaxSeconds', '保活最长间隔', this.taskDraft.keepaliveMaxSeconds, LIMITS.keepaliveMaxSeconds.min, LIMITS.keepaliveMaxSeconds.max, 0.5, '秒')}
@@ -552,13 +594,13 @@ export class AppShell extends HTMLElement {
         <aside class="surface launch-panel">
           <span class="section-kicker">启动前确认</span><h2>任务摘要</h2>
           <dl class="launch-summary">
-            <div><dt>调度端</dt><dd data-summary-field="scheduler">${this.taskDraft.scheduler === 'both' ? '浏览器 + Python' : this.taskDraft.scheduler === 'python' ? 'Python' : '浏览器'}</dd></div>
+            <div><dt>调度端</dt><dd data-summary-field="scheduler">${pool ? 'Python 后台' : this.taskDraft.scheduler === 'both' ? '浏览器 + Python' : this.taskDraft.scheduler === 'python' ? 'Python' : '浏览器'}</dd></div>
             <div><dt>通道</dt><dd data-summary-field="channel"><span class="channel-logo ${this.taskDraft.channel === 'gpt' ? 'gpt-logo' : 'claude-logo'}">${this.taskDraft.channel === 'gpt' ? 'G' : 'C'}</span>${this.taskDraft.channel === 'gpt' ? 'GPT Responses' : 'Claude Messages'}</dd></div>
-            <div><dt>Key</dt><dd data-summary-field="key">${key ? `${escapeHtml(key.alias)} · ${escapeHtml(keyTail(key.value))}` : '—'}</dd></div>
-            <div><dt>API 服务</dt><dd data-summary-field="base-url" title="${escapeHtml(key?.baseUrl ?? '')}">${escapeHtml(key?.baseUrl ?? '—')}</dd></div>
+            <div><dt>Key</dt><dd data-summary-field="key">${pool ? `已选 ${this.taskDraft.keyIds.length} 个 Key` : key ? `${escapeHtml(key.alias)} · ${escapeHtml(keyTail(key.value))}` : '—'}</dd></div>
+            <div><dt>API 服务</dt><dd data-summary-field="base-url" title="${escapeHtml(key?.baseUrl ?? '')}">${pool ? '按成员分别连接' : escapeHtml(key?.baseUrl ?? '—')}</dd></div>
             <div><dt>模型</dt><dd data-summary-field="model">${escapeHtml(this.displayDraftModel())}</dd></div>
-            <div><dt>重试</dt><dd data-summary-field="attempts">最多 ${this.taskDraft.maxAttempts} 次</dd></div>
-            <div><dt>并发</dt><dd data-summary-field="concurrency">${this.taskDraft.concurrency} 线程</dd></div>
+            <div><dt>重试</dt><dd data-summary-field="attempts">${pool ? '持续重试' : `最多 ${this.taskDraft.maxAttempts} 次`}</dd></div>
+            <div><dt>并发</dt><dd data-summary-field="concurrency">${this.concurrencySummary()}</dd></div>
             <div><dt>间隔</dt><dd data-summary-field="interval">${this.taskDraft.intervalSeconds} 秒</dd></div>
             <div><dt>自动保活</dt><dd data-summary-field="keepalive">${this.taskDraft.keepalive ? `${this.taskDraft.keepaliveMinSeconds}–${this.taskDraft.keepaliveMaxSeconds} 秒` : '关闭'}</dd></div>
           </dl>
@@ -595,21 +637,22 @@ export class AppShell extends HTMLElement {
   private taskCardMarkup(task: Task): string {
     const status = taskStatusMeta(task);
     const notification = notificationMeta(task);
-    const progress = Math.min(100, (task.probeAttempts / task.config.maxAttempts) * 100);
+    const maxAttempts = 'maxAttempts' in task.config ? task.config.maxAttempts : undefined;
+    const progress = maxAttempts ? Math.min(100, task.probeAttempts / maxAttempts * 100) : 0;
     const canPause = isTaskActive(task);
     const canResume = task.status === 'paused';
     const canCancel = isTaskActive(task) || task.status === 'paused';
     const canRetry = ['waiting', 'keepalive', 'paused'].includes(task.status);
     return `
-      <article class="task-card ${isAcceptedStatus(task.status) ? 'task-accepted' : ''}" data-task-id="${task.id}">
+      <article class="task-card ${task.pool ? 'task-pool' : ''} ${isAcceptedStatus(task.status) ? 'task-accepted' : ''}" data-task-id="${task.id}">
         <div class="task-card-select"><input type="checkbox" data-action="select-task" data-task-id="${task.id}" aria-label="选择任务 ${escapeHtml(task.config.name)}" ${this.selectedTaskIds.has(task.id) ? 'checked' : ''} /></div>
         <button class="task-card-main" type="button" data-action="open-task" data-task-id="${task.id}" aria-label="查看 ${escapeHtml(task.config.name)} 详情">
           <span class="channel-logo ${task.config.channel === 'gpt' ? 'gpt-logo' : 'claude-logo'}">${task.config.channel === 'gpt' ? 'G' : 'C'}</span>
-          <span class="task-title"><strong>${escapeHtml(task.config.name)}</strong><small><span class="scheduler-label ${task.scheduler}">${task.scheduler === 'python' ? 'Python' : '浏览器'}</span> ${escapeHtml(task.config.model)}</small></span>
+          <span class="task-title"><strong>${escapeHtml(task.config.name)}</strong><small><span class="scheduler-label ${task.scheduler}">${task.pool ? 'Python · Key 池' : task.scheduler === 'python' ? 'Python' : '浏览器'}</span> ${escapeHtml(task.config.model)}</small></span>
         </button>
         <div class="task-state"><span class="cell-label">状态</span><ar-status-pill label="${status.label}" tone="${status.tone}" dot></ar-status-pill><small>${escapeHtml(status.description)}</small></div>
-        <div class="task-progress-cell"><span class="cell-label">探活 ${task.probeAttempts} / ${task.config.maxAttempts}</span><div class="attempt-line"><strong>${task.attemptsMade}</strong><span>次 · 成功 ${task.successes}</span></div><div class="progress-track" role="progressbar" aria-label="探活进度" aria-valuemin="0" aria-valuemax="${task.config.maxAttempts}" aria-valuenow="${task.probeAttempts}"><span style="width:${progress}%"></span></div></div>
-        <div class="task-next"><span class="cell-label">下次请求</span><strong data-countdown-task="${task.id}">—</strong><small>${task.status === 'requesting' ? '等待首事件' : task.lastError ? escapeHtml(task.lastError) : task.healthy && task.config.keepalive ? `保活 ${task.config.keepaliveMinSeconds}–${task.config.keepaliveMaxSeconds} 秒` : `探活 ${task.config.intervalSeconds} 秒`}</small></div>
+        <div class="task-progress-cell"><span class="cell-label">${task.pool ? `成员 ${task.pool.members.filter(m => !m.disabled).length} / ${task.pool.members.length} · 第 ${task.pool.races} 次竞争` : `探活 ${task.probeAttempts} / ${maxAttempts}`}</span><div class="attempt-line"><strong>${task.attemptsMade}</strong><span>次 · 成功 ${task.successes}</span></div>${maxAttempts ? `<div class="progress-track" role="progressbar" aria-label="探活进度" aria-valuemin="0" aria-valuemax="${maxAttempts}" aria-valuenow="${task.probeAttempts}"><span style="width:${progress}%"></span></div>` : ''}</div>
+        <div class="task-next"><span class="cell-label">${task.pool?.recoveryDeadline ? '全池重试倒计时' : '下次请求'}</span><strong data-countdown-task="${task.id}">—</strong><small>${task.status === 'requesting' ? '等待首事件' : task.lastError ? escapeHtml(task.lastError) : task.healthy && task.config.keepalive ? `保活 ${task.config.keepaliveMinSeconds}–${task.config.keepaliveMaxSeconds} 秒` : `探活 ${task.config.intervalSeconds} 秒`}</small></div>
         <div class="task-notification"><span class="cell-label">通知</span><ar-status-pill label="${notification.label}" tone="${notification.tone}"></ar-status-pill><small>${task.notificationAttempts ? `${task.notificationAttempts} 次投递` : '成功通知'}</small></div>
         <div class="task-actions">
           ${canPause ? `<button class="icon-button" type="button" data-action="pause-task" data-task-id="${task.id}" aria-label="暂停 ${escapeHtml(task.config.name)}">${icon('pause')}</button>` : ''}
@@ -761,10 +804,11 @@ export class AppShell extends HTMLElement {
               <div><dt>自动保活</dt><dd>${task.config.keepalive ? `${task.config.keepaliveMinSeconds}–${task.config.keepaliveMaxSeconds} 秒` : '关闭'}</dd></div>
               <div><dt>实际模型</dt><dd>${escapeHtml(task.config.model)}</dd></div>
               <div><dt>通道</dt><dd>${task.config.channel === 'gpt' ? 'GPT · /v1/responses' : 'Claude · /v1/messages?beta=true'}</dd></div>
-              <div><dt>API 服务</dt><dd title="${escapeHtml(task.config.baseUrl)}">${escapeHtml(task.config.baseUrl)}</dd></div>
+              <div><dt>API 服务</dt><dd>${'baseUrl' in task.config ? escapeHtml(task.config.baseUrl) : '按池成员分别连接'}</dd></div>
               <div><dt>启动时间</dt><dd>${formatDateTime(task.startedAt)}</dd></div>
               <div><dt>最近成功</dt><dd data-drawer-field="accepted-at">${formatDateTime(task.acceptedAt)}</dd></div>
             </dl>
+            <div data-drawer-pool>${this.poolDetailMarkup(task)}</div>
             <section class="drawer-section" aria-labelledby="notice-state-heading"><div class="drawer-section-head"><h3 id="notice-state-heading">通知状态</h3><ar-status-pill data-drawer-field="notification-status" label="${notification.label}" tone="${notification.tone}"></ar-status-pill></div><div class="notice-summary"><span aria-hidden="true">${icon('send')}</span><p data-drawer-field="notification-description">${escapeHtml(this.notificationDescription(task))}</p><strong data-drawer-field="notification-attempts">${task.notificationAttempts || 0} 次</strong></div><button class="button secondary tiny" type="button" data-action="refresh-notification" data-task-id="${task.id}" data-drawer-field="notification-refresh" ${task.notificationId ? '' : 'disabled'}>手动刷新回执</button></section>
             <section class="drawer-section" aria-labelledby="response-heading"><div class="drawer-section-head"><h3 id="response-heading">响应摘要</h3><span data-drawer-field="response-bytes">${new TextEncoder().encode(task.responseSummary).length} / 8192 bytes</span></div><pre class="response-box" data-drawer-field="response-summary">${escapeHtml(task.responseSummary || '尚未收到成功响应正文。')}</pre></section>
             <section class="drawer-section" aria-labelledby="events-heading"><div class="drawer-section-head"><h3 id="events-heading">结构化事件</h3><span data-drawer-field="event-count">${task.events.length} / 200</span></div><ol class="event-timeline">${[...task.events].reverse().map((event) => this.drawerEventMarkup(event)).join('')}</ol></section>
@@ -783,6 +827,9 @@ export class AppShell extends HTMLElement {
     const status = taskStatusMeta(task);
     const notification = notificationMeta(task);
     this.updatePill(drawer, 'status', status.label, status.tone);
+    const poolView = drawer.querySelector<HTMLElement>('[data-drawer-pool]');
+    const poolMarkup = this.poolDetailMarkup(task);
+    if (poolView && poolView.innerHTML !== poolMarkup) poolView.innerHTML = poolMarkup;
     this.updatePill(drawer, 'notification-status', notification.label, notification.tone);
     this.updateDrawerText(drawer, 'attempts', `${task.attemptsMade} / ${task.successes}`);
     this.updateDrawerText(
@@ -927,9 +974,16 @@ export class AppShell extends HTMLElement {
   private async submitTask(form: HTMLFormElement): Promise<void> {
     if (!this.validIntervals(form) || this.submittingTask) return;
     const data = new FormData(form);
-    const scheduler = String(data.get('scheduler')) as SchedulerChoice;
+    const pool = data.get('taskKind') === 'pool';
+    const scheduler = pool ? 'python' : String(data.get('scheduler')) as SchedulerChoice;
+    const keyIds = pool ? data.getAll('poolKeyIds').map(String) : [String(data.get('keyId'))];
+    if (pool && keyIds.length < 2) {
+      this.querySelector<HTMLElement>('#pool-key-error')!.textContent = '请至少选择两个不同的 Key';
+      this.querySelector<HTMLInputElement>('[name=keyQuery]')?.focus();
+      return;
+    }
     const channel = String(data.get('channel')) as Channel;
-    const keyId = String(data.get('keyId'));
+    const keyId = keyIds[0];
     const key = this.store.keys.find((record) => record.id === keyId);
     if (!key) {
       this.toast('所选 Key 已不存在', 'danger');
@@ -943,15 +997,12 @@ export class AppShell extends HTMLElement {
     const config: TaskConfig = {
       name: String(data.get('name')).trim(),
       channel,
-      keyId,
-      baseUrl: key.baseUrl,
+      ...(pool ? { keyIds, keepalive: true as const } : { keyId, baseUrl: key.baseUrl, maxAttempts: Number(data.get('maxAttempts')), keepalive: data.get('keepalive') === 'on' }),
       model,
       prompt: String(data.get('prompt')).trim(),
-      maxAttempts: Number(data.get('maxAttempts')),
       intervalSeconds: Number(data.get('intervalSeconds')),
       timeoutSeconds: Number(data.get('timeoutSeconds')),
       concurrency: Number(data.get('concurrency')),
-      keepalive: data.get('keepalive') === 'on',
       keepaliveMinSeconds: Number(data.get('keepaliveMinSeconds')),
       keepaliveMaxSeconds: Number(data.get('keepaliveMaxSeconds')),
       telegramChatId: String(data.get('telegramChatId') ?? '').trim(),
@@ -966,12 +1017,12 @@ export class AppShell extends HTMLElement {
     this.suppressViewRender = true;
     this.renderView();
     try {
-      const authOk = await this.store.authenticateKey(keyId, scheduler);
-      if (!authOk) { this.toast('启动已停止：所选调度端鉴权未通过', 'danger'); return; }
+      const authResults = await Promise.all(keyIds.map(id => this.store.authenticateKey(id, scheduler)));
+      if (authResults.some(ok => !ok)) { this.toast('启动已停止：所选调度端鉴权未通过', 'danger'); return; }
       const tasks = await this.store.createTask(config, scheduler);
       this.schedulerFilter = scheduler === 'both' ? 'all' : scheduler;
       this.taskDraft = this.makeDraft();
-      this.toast(`已启动 ${tasks.length} 个独立任务`, 'success');
+      this.toast(pool ? `已启动 ${keyIds.length} 个 Key 的池任务` : `已启动 ${tasks.length} 个独立任务`, 'success');
       this.navigate('tasks');
       this.updateSchedulerBar();
     } finally {
@@ -1003,11 +1054,11 @@ export class AppShell extends HTMLElement {
     if (!this.validIntervals(form)) return;
     const data = new FormData(form);
     const settings: AppSettings = {
+      keepalive: data.get('keepalive') === 'on',
       attempts: Number(data.get('attempts')),
       intervalSeconds: Number(data.get('intervalSeconds')),
       timeoutSeconds: Number(data.get('timeoutSeconds')),
       concurrency: Number(data.get('concurrency')),
-      keepalive: data.get('keepalive') === 'on',
       keepaliveMinSeconds: Number(data.get('keepaliveMinSeconds')),
       keepaliveMaxSeconds: Number(data.get('keepaliveMaxSeconds')),
       telegramChatId: String(data.get('telegramChatId') ?? '').trim(),
@@ -1037,6 +1088,20 @@ export class AppShell extends HTMLElement {
       case 'logout':
         await serverRequest('/api/auth/logout', 'POST');
         window.dispatchEvent(new Event('authentication-required'));
+        break;
+      case 'select-pool-keys':
+        this.captureDraft();
+        this.taskDraft.keyIds = this.store.keys.filter(key => key.authStatus === 'ready').map(key => key.id);
+        this.syncDraftModel(true);
+        this.renderView();
+        this.querySelector<HTMLElement>('[data-action=select-pool-keys]')?.focus();
+        break;
+      case 'clear-pool-keys':
+        this.captureDraft();
+        this.taskDraft.keyIds = [];
+        this.syncDraftModel(true);
+        this.renderView();
+        this.querySelector<HTMLElement>('[data-action=clear-pool-keys]')?.focus();
         break;
       case 'refresh-keys':
         await this.store.refreshKeys();
@@ -1178,7 +1243,14 @@ export class AppShell extends HTMLElement {
     }
     if (!target.closest('#task-form')) return;
     this.captureDraft();
-    if (target.name === 'channel' || target.name === 'keyId') {
+    if (target.name === 'taskKind' || target.name === 'poolKeyIds') {
+      if (this.taskDraft.pool) { this.taskDraft.scheduler = 'python'; this.taskDraft.keepalive = true; }
+      this.syncDraftModel(true);
+      const value = target.value;
+      this.renderView();
+      this.querySelector<HTMLElement>(`[name="${target.name}"][value="${CSS.escape(value)}"]`)?.focus();
+      if (target.name === 'taskKind') this.querySelector<HTMLElement>('[name=taskKind]')?.focus();
+    } else if (target.name === 'channel' || target.name === 'keyId') {
       this.syncDraftModel(true);
       this.renderView();
     } else if (target.name === 'modelChoice') {
@@ -1195,6 +1267,9 @@ export class AppShell extends HTMLElement {
     }
     if (!target.closest('#task-form')) return;
     this.captureDraft();
+    if (target.name === 'keyQuery') {
+      for (const row of this.querySelectorAll<HTMLElement>('[data-pool-key-search]')) row.hidden = !row.dataset.poolKeySearch!.includes(target.value.toLowerCase().trim());
+    }
     const summaryNames = new Set(['maxAttempts', 'intervalSeconds', 'concurrency', 'name', 'customModel', 'keepaliveMinSeconds', 'keepaliveMaxSeconds']);
     if (summaryNames.has(target.name)) this.updateLaunchSummary();
   }
@@ -1243,6 +1318,10 @@ export class AppShell extends HTMLElement {
     if (!form) return;
     const data = new FormData(form);
     this.taskDraft = {
+      pool: data.get('taskKind') === 'pool',
+      keyIds: form.querySelector('[name=poolKeyIds]') ? data.getAll('poolKeyIds').map(String) : this.taskDraft.keyIds,
+      keyQuery: String(data.get('keyQuery') ?? this.taskDraft.keyQuery),
+      keepalive: data.get('keepalive') === 'on',
       notificationProvider: String(data.get('notificationProvider')) as NotificationProvider,
       scheduler: String(data.get('scheduler') ?? this.taskDraft.scheduler) as SchedulerChoice,
       name: String(data.get('name') ?? this.taskDraft.name),
@@ -1255,7 +1334,6 @@ export class AppShell extends HTMLElement {
       intervalSeconds: Number(data.get('intervalSeconds') ?? this.taskDraft.intervalSeconds),
       timeoutSeconds: Number(data.get('timeoutSeconds') ?? this.taskDraft.timeoutSeconds),
       concurrency: Number(data.get('concurrency') ?? this.taskDraft.concurrency),
-      keepalive: data.get('keepalive') === 'on',
       keepaliveMinSeconds: Number(data.get('keepaliveMinSeconds') ?? this.taskDraft.keepaliveMinSeconds),
       keepaliveMaxSeconds: Number(data.get('keepaliveMaxSeconds') ?? this.taskDraft.keepaliveMaxSeconds),
       telegramChatId: String(data.get('telegramChatId') ?? this.taskDraft.telegramChatId),
@@ -1279,8 +1357,8 @@ export class AppShell extends HTMLElement {
     const intervalRow = panel.querySelector<HTMLElement>('[data-summary-field="interval"]');
     const keepaliveRow = panel.querySelector<HTMLElement>('[data-summary-field="keepalive"]');
     if (modelRow) modelRow.textContent = this.displayDraftModel();
-    if (retryRow) retryRow.textContent = `最多 ${this.taskDraft.maxAttempts || 0} 次`;
-    if (concurrencyRow) concurrencyRow.textContent = `${this.taskDraft.concurrency || 0} 线程`;
+    if (retryRow) retryRow.textContent = this.taskDraft.pool ? '持续重试' : `最多 ${this.taskDraft.maxAttempts || 0} 次`;
+    if (concurrencyRow) concurrencyRow.textContent = this.concurrencySummary();
     if (intervalRow) intervalRow.textContent = `${this.taskDraft.intervalSeconds || 0} 秒`;
     if (keepaliveRow) keepaliveRow.textContent = this.taskDraft.keepalive ? `${this.taskDraft.keepaliveMinSeconds}–${this.taskDraft.keepaliveMaxSeconds} 秒` : '关闭';
   }
@@ -1290,6 +1368,7 @@ export class AppShell extends HTMLElement {
     const channel: Channel = 'gpt';
     const models = readyKey ? modelsForChannel(readyKey.models, channel) : [];
     return {
+      pool: false, keyIds: [], keyQuery: '',
       scheduler: this.schedulerFilter === 'all' ? this.taskDraft?.scheduler ?? 'browser' : this.schedulerFilter,
       notificationProvider: this.notificationProvider(this.store.settings),
       name: `GPT 队列探针 ${new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date())}`,
@@ -1318,13 +1397,13 @@ export class AppShell extends HTMLElement {
     const keyStillReady = this.store.keys.some(
       (key) => key.id === this.taskDraft?.keyId && key.authStatus === 'ready',
     );
-    if (force || !this.taskDraft || !keyStillReady) this.taskDraft = this.makeDraft();
+    if (force || !this.taskDraft || !this.taskDraft.pool && !keyStillReady) this.taskDraft = this.makeDraft();
+    this.taskDraft.keyIds = this.taskDraft.keyIds.filter(id => this.store.keys.some(key => key.id === id));
     this.syncDraftModel(false);
   }
 
   private syncDraftModel(force: boolean): void {
-    const key = this.store.keys.find((item) => item.id === this.taskDraft.keyId);
-    const models = key ? modelsForChannel(key.models, this.taskDraft.channel) : [];
+    const models = this.draftModels();
     if (
       force ||
       (this.taskDraft.modelChoice !== '__custom__' && !models.includes(this.taskDraft.modelChoice))
@@ -1441,7 +1520,8 @@ export class AppShell extends HTMLElement {
   private updateCountdowns(): void {
     for (const node of this.querySelectorAll<HTMLElement>('[data-countdown-task]')) {
       const task = this.store.engine.get(node.dataset.countdownTask ?? '');
-      const value = task?.nextAttemptAt ? countdownLabel(task.nextAttemptAt) : '—';
+      const due = task?.pool?.recoveryDeadline ?? task?.nextAttemptAt;
+      const value = due ? countdownLabel(due) : '—';
       if (node.textContent !== value) node.textContent = value;
     }
   }

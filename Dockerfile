@@ -14,7 +14,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY codex_board.py codex_client.py codex_memory.py codex_mouse.py codex_notify.py codex_poll.py codex_tasks.py codex_ui.py logic_questions.json ./
 COPY --from=build /build/any/dist ./any/dist
-COPY any/server.mjs any/python-bridge.mjs any/python_scheduler.py ./any/
+COPY any/server.mjs any/python-bridge.mjs any/python_scheduler.py any/python_pool.py any/python_transport.py ./any/
 ENV NODE_ENV=production \
     PYTHONDONTWRITEBYTECODE=1 \
     ANYROUTER_HOST=0.0.0.0 \

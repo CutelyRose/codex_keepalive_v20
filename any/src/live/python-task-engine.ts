@@ -1,4 +1,4 @@
-import type { AuthResult, Task, TaskConfig } from '../core/types';
+import type { AuthResult, ManagedTask as Task, ManagedTaskConfig as TaskConfig } from '../core/types';
 import { serverRequest } from '../core/api-client';
 
 export class PythonTaskEngine {

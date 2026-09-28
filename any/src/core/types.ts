@@ -48,6 +48,31 @@ export interface TaskConfig extends NotificationSettings {
   keepaliveMaxSeconds: number;
   oneMillion: boolean;
 }
+export type PoolTaskConfig = Omit<TaskConfig, 'keyId' | 'baseUrl' | 'maxAttempts' | 'keepalive'> & {
+  keyIds: string[];
+  keepalive: true;
+};
+export type ManagedTaskConfig = TaskConfig | PoolTaskConfig;
+export interface PoolMember {
+  keyId: string;
+  alias: string;
+  keyTail: string;
+  baseUrl: string;
+  sessionId: string;
+  attemptsMade: number;
+  successes: number;
+  disabled: boolean;
+  status: 'racing' | 'keeping' | 'recovering' | 'standby' | 'disabled' | 'paused';
+  lastError?: string;
+  nextAttemptAt?: number;
+}
+export interface PoolState {
+  phase: 'racing' | 'keeping' | 'recovering';
+  activeKeyId?: string;
+  recoveryDeadline?: number;
+  races: number;
+  members: PoolMember[];
+}
 export interface TaskEvent {
   id: string;
   at: number;
@@ -56,10 +81,11 @@ export interface TaskEvent {
   detail: string;
   tone: 'neutral' | 'info' | 'success' | 'warning' | 'danger';
 }
-export interface Task {
+export interface Task<C extends ManagedTaskConfig = TaskConfig> {
   id: string;
   scheduler: Scheduler;
-  config: TaskConfig;
+  config: C;
+  pool?: PoolState;
   status: TaskStatus;
   attemptsMade: number;
   probeAttempts: number;
@@ -87,6 +113,7 @@ export interface Task {
   notificationPollingPaused?: boolean;
   notificationReadError?: string;
 }
+export type ManagedTask = Task<ManagedTaskConfig>;
 export interface StoreChangeDetail { kind: 'keys' | 'tasks' | 'settings' }
 export interface NotificationPayload {
   taskId: string;

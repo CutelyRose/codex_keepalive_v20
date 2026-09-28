@@ -33,6 +33,8 @@ AppStore 合并两端任务。ID 与 scheduler 标识执行者，操作路由到
 | src/live/request-builders.ts | 共用 GPT / Claude 请求构造 |
 | python-bridge.mjs | Python 子进程及 stdio 请求响应关联 |
 | python_scheduler.py | 根目录 codex_tasks.Runtime 的网页适配、HTTP 轮次和持久化 |
+| python_pool.py | 池成员调度、唯一保活成员、30 秒截止与状态恢复 |
+| python_transport.py | 两种 Python 任务共用的 HTTP/SSE 请求、取消及错误分类 |
 | server.mjs | 登录会话、Key 持久化、静态文件、Python 任务接口和通知队列 |
 
 Python 复用根目录调度器管理轮次、时间、并发占位和修订号；适配层处理并发 HTTP / SSE 及网页状态。根目录终端入口保持独立可用。
@@ -76,6 +78,20 @@ healthy 保存最近轮次是否成功；attemptsMade 是累计实际请求数�
 
 Python 最多同时执行 8 个轮次，未返回的物理请求仍占用位置。暂停、取消、删除中断已建立的连接，修订号阻止旧结果更改后续状态。
 
+### Python Key 池
+
+池配置与普通任务配置明确区分：池传 `keyIds: string[]`，至少两个不同 Key；不接受 `keyId`、`baseUrl` 或 `maxAttempts`，`keepalive` 固定为 `true`。其余模型、提示词、时间、每 Key 并发及通知字段共用验证。Node 按成员从服务器读取 Key 和服务地址，使用现有请求构造器为每个成员生成独立会话与请求快照。拒绝不同记录引用相同凭据的池。
+
+公开任务包含 `pool: {phase, activeKeyId?, recoveryDeadline?, races, members}`；阶段为 `racing / keeping / recovering`，成员包含 Key ID、别名、尾号、地址、会话、计数和最近错误，不包含请求头或凭据。任务概要仍省略流摘要和事件；成员详情可直接随概要显示。
+
+一个池占一个根调度器并发位置，成员并发在池内展开。`WebRuntime.step` 在同一把调度锁内推进池状态，并使用根调度器的扩展入口避免池再次被当作普通任务发送。等待重试时释放位置，尚未结束的物理请求保持占位；30 秒到期时可在原池位置启动新竞争，不等待旧连接收尾。
+
+成功流事件在调度锁内确认唯一胜者并取消其他成员。成员每轮有独立请求集合，失败只影响对应成员；永久错误停用该成员。池内部轮次版本与取消标志阻止旧事件更改胜者，旧线程结束后仍会清理连接和占位。正常保活只有一个请求，恢复阶段只有原成员按配置并发重新探活。
+
+首次失败／异常断流确定恢复截止点，后续失败或立即请求不重置。调度 tick 和流事件处理都先检查截止点，以单调时钟判断 30 秒边界。到期清除旧保活资格并全池竞争；每成员 `Retry-After` 保留，未到时间的成员等待到期再参与。
+
+池及成员作为同一 SQLite 记录保存，沿用 Windows DPAPI 和其他平台的数据目录权限。重启时全池竞争继续；保活状态先由原成员进入新的 30 秒验证期；已在恢复期则沿用原绝对截止时间，停机时间计入。暂停和终态不启动。每个成员的会话在保活、竞争和重启后保持不变，重新开始任务生成新会话。
+
 单流限制 2 MiB、摘要 8 KiB、事件 200 条；空闲上限 60 秒、总时限 10 分钟。无效 Key、模型和额度错误停止任务；HTTP 408/409/425/429/500/502/503/504/529 可重试。
 
 ## 登录与 Key 接口
@@ -92,7 +108,7 @@ Python 最多同时执行 8 个轮次，未返回的物理请求仍占用位置�
 | GET /api/keys | 已登录客户端共享的 KeyRecord 列表 |
 | POST /api/keys | {alias, value, baseUrl}；迁移时可带原 id、鉴权结果和模型缓存，同 ID 不覆盖已存凭据 |
 | PATCH /api/keys/{id} | {baseUrl} 修改地址并清空模型缓存；或 {expectedBaseUrl, auth: AuthResult} 保存鉴权结果 |
-| DELETE /api/keys/{id} | 取消关联 Python 任务并删除 Key |
+| DELETE /api/keys/{id} | 取消关联 Python 普通任务及整个关联池，并删除 Key |
 
 Key 存在 `data/notifications.sqlite` 的 `api_keys` 表，沿用服务器受限数据目录。Key 原文只对已登录的管理界面开放，供浏览器直接请求模型服务；前端不再持久化 Key。首次进入工作区时导入当前浏览器 Key，保留 ID；全部写入成功才清除原副本，重复导入按 ID 去重。地址变更后拒绝保存基于旧地址的鉴权结果。列表在工作区加载、进入 Key / 新建任务页面及手动刷新时读取。
 
@@ -104,7 +120,7 @@ Key 存在 `data/notifications.sqlite` 的 `api_keys` 表，沿用服务器受�
 | POST /api/python/models | {keyId}，从服务器读取 Key 和地址，由 Python 鉴权并读取模型 |
 | GET /api/python/tasks | 任务概要，events 与 responseSummary 为空；不返回模型 Key、ShowDoc 推送 URL、Bot Token 或 SendKey |
 | GET /api/python/tasks?detail={id} | 仅指定任务携带事件和响应摘要 |
-| POST /api/python/tasks | {config: TaskConfig}，按 config.keyId 读取服务器凭据和地址，创建任务 |
+| POST /api/python/tasks | {config: TaskConfig 或 PoolTaskConfig}，按 keyId 或 keyIds 读取服务器凭据和地址，创建普通任务或池 |
 | POST /api/python/tasks/{id}/pause | 暂停 |
 | POST /api/python/tasks/{id}/resume | 继续 |
 | POST /api/python/tasks/{id}/retryNow | 跳过等待，立即请求 |

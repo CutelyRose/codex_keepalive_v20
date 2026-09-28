@@ -2,6 +2,8 @@
 
 同一页面管理浏览器和 Python 任务，支持管理密码登录、服务器共享 Key、双端同时调度、成功后自动保活，以及 ShowDoc / Telegram / Server 酱通知。Python 任务在关闭页面后继续运行。探活次数与单轮并发不设固定最大值，按填写的正整数执行。
 
+新增 **Python Key 池任务**：多选 Key 一起挤入，首个成功号独自保活，其余待命。保活号失败或异常断流后独自恢复 30 秒，仍未成功则全池重新竞争；持续重试到成功或手动停止。
+
 ## 1Panel 部署
 
 镜像：`ghcr.io/cutelyrose/codex_keepalive_v20:latest`（Linux amd64 / arm64）。

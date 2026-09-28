@@ -19,5 +19,7 @@
 !any/server.mjs
 !any/python-bridge.mjs
 !any/python_scheduler.py
+!any/python_pool.py
+!any/python_transport.py
 !any/src/
 !any/src/**

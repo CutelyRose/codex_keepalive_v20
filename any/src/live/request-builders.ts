@@ -4,6 +4,8 @@ import { makeId } from '../core/utils';
 import { buildClaudeContractRequest } from './claude-contract';
 import { buildCodexContractRequest } from './codex-contract';
 
+type RequestConfig = Pick<TaskConfig, 'baseUrl' | 'channel' | 'model' | 'prompt' | 'oneMillion'>;
+
 export interface BuiltRequest {
   url: string;
   headers: Headers;
@@ -32,7 +34,7 @@ const CODEX_PROBE_INSTRUCTIONS = [
 ].join(' ');
 
 export function buildGptRequest(
-  config: TaskConfig,
+  config: RequestConfig,
   token: string,
   options: RequestBuilderOptions = {},
 ): BuiltRequest {
@@ -53,7 +55,7 @@ export function buildGptRequest(
 }
 
 export function buildClaudeRequest(
-  config: TaskConfig,
+  config: RequestConfig,
   token: string,
   options: RequestBuilderOptions = {},
 ): BuiltRequest {
@@ -75,7 +77,7 @@ export function buildClaudeRequest(
 }
 
 export function buildTaskRequest(
-  config: TaskConfig,
+  config: RequestConfig,
   token: string,
   options: RequestBuilderOptions = {},
 ): BuiltRequest {
