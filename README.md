@@ -1,8 +1,8 @@
 # AnyRouter 双端调度与自动保活
 
-同一页面管理浏览器和 Python 任务，支持管理密码登录、服务器共享 Key、双端同时调度、成功后自动保活，以及 ShowDoc / Telegram / Server 酱通知。Python 任务在关闭页面后继续运行。探活次数与单轮并发不设固定最大值，按填写的正整数执行。
+同一页面管理浏览器和服务端任务，支持管理密码登录、服务器共享 Key、双端同时调度、成功后自动保活，以及 ShowDoc / Telegram / Server 酱通知。服务端任务由 Node 服务调度，关闭页面后继续运行。探活次数与单轮并发不设固定最大值，按填写的正整数执行。
 
-新增 **Python Key 池任务**：多选 Key 一起挤入，首个成功号独自保活，其余待命。保活号失败或异常断流后独自恢复 30 秒，仍未成功则全池重新竞争；持续重试到成功或手动停止。
+**Key 池任务**（服务端）：多选 Key 一起挤入，首个成功号独自保活，其余待命。保活号失败或异常断流后独自恢复 30 秒，仍未成功则全池重新竞争；持续重试到成功或手动停止。
 
 ## 1Panel 部署
 
@@ -23,7 +23,6 @@ ANYROUTER_PASSWORD=替换为随机管理密码
 
 - [网页使用与本地启动](any/README.md)
 - [双端调度实现](any/TECHNICAL.md)
-- [性能优化及实测](any/PERFORMANCE.md)
 - [原终端版使用说明](使用说明.md)
 
 推送 `main` 自动触发 [Docker 工作流](https://github.com/CutelyRose/codex_keepalive_v20/actions/workflows/docker.yml)。测试和容器重启验证通过后，发布 `latest` 及完整提交 SHA 标签。

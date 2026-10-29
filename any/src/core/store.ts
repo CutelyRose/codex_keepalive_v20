@@ -1,7 +1,7 @@
 import { DEFAULT_SETTINGS, STORAGE_KEYS } from './constants';
 import { AnyRouterGateway } from '../live/anyrouter-gateway';
 import { LiveTaskEngine } from '../live/live-task-engine';
-import { PythonTaskEngine } from '../live/python-task-engine';
+import { ServerTaskClient } from '../live/server-task-client';
 import { validateTaskConfig, validatePoolTaskConfig } from './task-config';
 import { loadSettings, loadTasks, saveSettings, saveTasks } from './storage';
 import type { AppSettings, KeyRecord, SchedulerChoice, StoreChangeDetail, ManagedTask as Task, ManagedTaskConfig as TaskConfig } from './types';
@@ -26,11 +26,11 @@ export class AppStore extends EventTarget {
   private keysRevision = 0;
   settings = loadSettings();
   private readonly browser: LiveTaskEngine;
-  readonly python: PythonTaskEngine;
+  readonly server: ServerTaskClient;
   authScheduler: SchedulerChoice = 'browser';
   readonly engine = {
-    list: (): Task[] => [...this.browser.list(), ...this.python.list()].sort((a, b) => b.startedAt - a.startedAt),
-    get: (id: string): Task | undefined => this.browser.get(id) ?? this.python.get(id),
+    list: (): Task[] => [...this.browser.list(), ...this.server.list()].sort((a, b) => b.startedAt - a.startedAt),
+    get: (id: string): Task | undefined => this.browser.get(id) ?? this.server.get(id),
     pause: (id: string) => this.action(id, 'pause'),
     resume: (id: string) => this.action(id, 'resume'),
     retryNow: (id: string) => this.action(id, 'retryNow'),
@@ -38,7 +38,7 @@ export class AppStore extends EventTarget {
     pauseMany: (ids: string[]) => this.many(ids, 'pause'),
     cancelMany: (ids: string[]) => this.many(ids, 'cancel'),
     removeMany: (ids: string[]) => this.many(ids, 'remove'),
-    refreshNotification: (id: string) => this.browser.get(id) ? this.browser.refreshNotification(id) : this.python.refresh(),
+    refreshNotification: (id: string) => this.browser.get(id) ? this.browser.refreshNotification(id) : this.server.refresh(),
   };
   private readonly gateway = new AnyRouterGateway();
   private browserUpdate?: ReturnType<typeof setTimeout>;
@@ -62,7 +62,7 @@ export class AppStore extends EventTarget {
         else if (this.browserUpdate === undefined) this.browserUpdate = setTimeout(this.flushBrowser, 250);
       },
     });
-    this.python = new PythonTaskEngine(() => this.emit('tasks'));
+    this.server = new ServerTaskClient(() => this.emit('tasks'));
     this.browser.restore(loadTasks());
     globalThis.addEventListener?.('pagehide', this.onPageHide);
   }
@@ -98,8 +98,8 @@ export class AppStore extends EventTarget {
     this.emit('keys');
     const { value, baseUrl } = record;
     const results = await Promise.all([
-      ...(scheduler !== 'python' ? [this.gateway.authenticate(value, baseUrl)] : []),
-      ...(scheduler !== 'browser' ? [this.python.authenticate(id)] : []),
+      ...(scheduler !== 'server' ? [this.gateway.authenticate(value, baseUrl)] : []),
+      ...(scheduler !== 'browser' ? [this.server.authenticate(id)] : []),
     ]);
     const result = results.find(item => !item.ok) ?? results[0];
     const current = this.keys.find((key) => key.id === id);
@@ -125,7 +125,7 @@ export class AppStore extends EventTarget {
       if (task.config.keyId === id) this.browser.cancel(task.id);
     }
     this.keys = this.keys.filter((key) => key.id !== id);
-    await this.python.refresh();
+    await this.server.refresh();
     this.emit('keys');
     return true;
   }
@@ -150,41 +150,41 @@ export class AppStore extends EventTarget {
 
   async createTask(config: TaskConfig, scheduler: SchedulerChoice): Promise<Task[]> {
     if ('keyIds' in config) {
-      if (scheduler !== 'python') throw new Error('Key 池仅支持 Python 后台调度');
+      if (scheduler !== 'server') throw new Error('Key 池仅支持服务端调度');
       config = validatePoolTaskConfig(config);
       if (config.keyIds.some(id => !this.keys.some(key => key.id === id && key.authStatus === 'ready'))) {
         throw new Error('池成员须先通过鉴权');
       }
-      return [await this.python.create(config)];
+      return [await this.server.create(config)];
     }
     const keyId = config.keyId;
     const key = this.keys.find((record) => record.id === keyId);
     if (!key || key.authStatus !== 'ready') throw new Error('任务对应的 Key 未通过鉴权');
     config = validateTaskConfig({ ...config, baseUrl: key.baseUrl });
     const tasks: Task[] = [];
-    if (scheduler !== 'browser') tasks.push(await this.python.create(config));
-    if (scheduler !== 'python') tasks.push(this.browser.create(config));
+    if (scheduler !== 'browser') tasks.push(await this.server.create(config));
+    if (scheduler !== 'server') tasks.push(this.browser.create(config));
     return tasks;
   }
 
   async restartTask(id: string): Promise<Task> {
     const source = this.engine.get(id);
     if (!source) throw new Error('任务不存在');
-    if (source.scheduler === 'python') return this.python.restart(id);
-    if ('keyIds' in source.config) throw new Error('Key 池仅支持 Python 后台调度');
+    if (source.scheduler === 'server') return this.server.restart(id);
+    if ('keyIds' in source.config) throw new Error('Key 池仅支持服务端调度');
     return this.browser.create({ ...source.config, baseUrl: normalizeApiBaseUrl(source.config.baseUrl) });
   }
 
   dispose(): void {
     this.onPageHide();
     globalThis.removeEventListener?.('pagehide', this.onPageHide);
-    this.browser.dispose(); this.python.dispose();
+    this.browser.dispose(); this.server.dispose();
     this.keys = [];
   }
 
   private async action(id: string, action: 'pause' | 'resume' | 'retryNow' | 'cancel' | 'remove'): Promise<boolean> {
     if (this.browser.get(id)) return this.browser[action](id);
-    return this.python.get(id) ? this.python.action(id, action) : false;
+    return this.server.get(id) ? this.server.action(id, action) : false;
   }
 
   private async many(ids: string[], action: 'pause' | 'cancel' | 'remove'): Promise<number> {

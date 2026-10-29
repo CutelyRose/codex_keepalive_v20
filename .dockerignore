@@ -1,15 +1,6 @@
 **
 !Dockerfile
 !.dockerignore
-!codex_board.py
-!codex_client.py
-!codex_memory.py
-!codex_mouse.py
-!codex_notify.py
-!codex_poll.py
-!codex_tasks.py
-!codex_ui.py
-!logic_questions.json
 !any/
 !any/package.json
 !any/package-lock.json
@@ -17,9 +8,5 @@
 !any/build.mjs
 !any/index.html
 !any/server.mjs
-!any/python-bridge.mjs
-!any/python_scheduler.py
-!any/python_pool.py
-!any/python_transport.py
 !any/src/
 !any/src/**

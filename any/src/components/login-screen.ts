@@ -20,7 +20,7 @@ export function createLoginScreen(): HTMLElement {
           <div class="login-lanes">
             <div><span class="login-lane-icon">${icon('overview')}</span><strong>浏览器</strong><small>在页面中运行</small></div>
             <span class="login-lane-connector">${icon('plus')}</span>
-            <div><span class="login-lane-icon python">${icon('tasks')}</span><strong>Python</strong><small>持续后台调度</small></div>
+            <div><span class="login-lane-icon server">${icon('tasks')}</span><strong>服务端</strong><small>持续后台调度</small></div>
           </div>
           <div class="login-visual-foot"><span>${icon('key')} 共享凭据</span><span>${icon('heartbeat')} 自动保活</span><span>${icon('send')} 成功通知</span></div>
         </div>

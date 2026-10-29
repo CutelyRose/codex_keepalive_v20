@@ -5,13 +5,14 @@ import { mkdir, readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
-import { PythonBridge } from './python-bridge.mjs';
-import { buildTaskRequest, validateTaskConfig, validatePoolTaskConfig, apiEndpoint, normalizeApiBaseUrl, notificationConfigured,
-  validateNotificationSettings, serverchanEndpoint } from './dist/task-requests.mjs';
+import { ServerTaskEngine, AnyRouterGateway, NotificationReadError, validatePoolTaskConfig, normalizeApiBaseUrl, notificationConfigured,
+  validateNotificationSettings, serverchanEndpoint } from './dist/server-core.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const RETRYABLE_HTTP = new Set([408, 409, 425, 429, 500, 502, 503, 504, 529]);
 const SESSION_SECONDS = 7 * 24 * 60 * 60;
+/** Server tasks are saved in batches; a crash loses at most this much progress. */
+const TASK_SAVE_MS = 1000;
 
 function problem(status, message) { return Object.assign(new Error(message), { status }); }
 function digest(value) { return createHash('sha256').update(value).digest(); }
@@ -105,7 +106,7 @@ function reply(response, status, value) {
   response.end(status === 204 ? undefined : JSON.stringify(value));
 }
 
-/** Browser and Python tasks share the site and notification queue. */
+/** Browser and server tasks share the site and notification queue. */
 export async function startServer({
   port = 8787, dbPath = join(ROOT, 'data', 'notifications.sqlite'),
   host = '127.0.0.1', origin = '', password = '',
@@ -122,27 +123,45 @@ export async function startServer({
     throw new Error('远程监听必须配置 ANYROUTER_ORIGIN 和 ANYROUTER_PASSWORD');
   }
   const passwordDigest = digest(password);
-  const internalAuthorization = `Bearer ${randomBytes(32).toString('base64url')}`;
-  const internalDigest = digest(internalAuthorization);
   const sessions = new Map(), loginFailures = new Map();
   process.umask(0o077);
   await mkdir(dirname(resolve(dbPath)), { recursive: true, mode: 0o700 });
   const db = new DatabaseSync(dbPath);
   db.exec(`PRAGMA journal_mode=WAL;
     CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE, payload TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, payload TEXT NOT NULL);`);
+    CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, payload TEXT NOT NULL);`);
   const notifications = new Map(db.prepare("SELECT id,payload FROM notifications WHERE json_extract(payload, '$.status') IN ('queued','retrying')")
     .all().map(r => [r.id, JSON.parse(r.payload)]));
   const noticeWrite = db.prepare('INSERT INTO notifications VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload');
   const noticeByTask = db.prepare('SELECT payload FROM notifications WHERE task_id=?');
   const noticeById = db.prepare('SELECT payload FROM notifications WHERE id=?');
+  const keyById = db.prepare('SELECT payload FROM api_keys WHERE id=?');
+  const taskWrite = db.prepare('INSERT INTO tasks VALUES (?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload');
+  const taskDelete = db.prepare('DELETE FROM tasks WHERE id=?');
+  const savedTasks = new Map(db.prepare('SELECT id,payload FROM tasks').all().map(row => [row.id, row.payload]));
   const deliveries = new Map();
-  let closing = false, timer, python;
+  const gateway = new AnyRouterGateway();
+  let closing = false, timer, saveTimer, engine;
 
   function findKey(id) {
-    const row = db.prepare('SELECT payload FROM api_keys WHERE id=?').get(textField(id, 'Key ID', 160));
+    const row = keyById.get(textField(id, 'Key ID', 160));
     if (!row) throw problem(404, 'Key 不存在，请刷新列表');
     return JSON.parse(row.payload);
+  }
+
+  /** Writes only tasks whose state changed since the last save, in one transaction. */
+  function saveTasks() {
+    clearTimeout(saveTimer); saveTimer = undefined;
+    db.exec('BEGIN');
+    try {
+      for (const task of engine.list()) {
+        const payload = JSON.stringify(task);
+        if (savedTasks.get(task.id) !== payload) { taskWrite.run(task.id, payload); savedTasks.set(task.id, payload); }
+      }
+      for (const id of savedTasks.keys()) if (!engine.get(id)) { taskDelete.run(id); savedTasks.delete(id); }
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
 
   function sessionCookie(response, token, maxAge) {
@@ -155,55 +174,28 @@ export async function startServer({
     return row && JSON.parse(row.payload);
   }
 
-  function pythonView(task) {
-    const notice = findNotice(task.notificationId);
-    if (notice) Object.assign(task, { notificationStatus: notice.status, notificationAttempts: notice.attempts,
-      notificationNextAttemptAt: notice.nextAttemptAt, notificationReadError: notice.error });
-    return task;
+  /** Public task state: notification credentials stay on the server; history only for the opened task. */
+  function taskView(task, details = true) {
+    return { ...task, config: { ...task.config, telegramBotToken: '', serverchanSendKey: '', showdocPushUrl: '' },
+      events: details ? task.events : [], responseSummary: details ? task.responseSummary : '' };
   }
 
-  function pythonTaskRecord(config, sessionId) {
-    const at = now();
-    return { id: `python_${randomUUID()}`, scheduler: 'python', sessionId, config, status: 'running',
-      attemptsMade: 0, probeAttempts: 0, successes: 0, healthy: false, startedAt: at, updatedAt: at,
-      responseSummary: '', events: [], notificationStatus: 'not-requested', notificationAttempts: 0,
-      notificationConfigured: notificationConfigured(config) };
-  }
-
-  function pythonRequest(config, token, sessionId) {
-    token = textField(token, 'API Key', 256);
-    if (/[\r\n]/.test(token)) throw problem(400, 'API Key 不能包含换行');
-    const request = buildTaskRequest(config, token, { sessionId });
-    return { url: request.url, headers: Object.fromEntries([...request.headers].map(([key, value]) =>
-      [key.toLowerCase() === 'authorization' ? 'Authorization' : key, value])), body: request.body };
-  }
-
-  async function createPythonTask(input, token) {
-    let config;
-    try { config = validateTaskConfig(input); }
+  function createTask(input) {
+    const key = findKey(input?.keyId);
+    try { return engine.create({ ...input, baseUrl: key.baseUrl }); }
     catch (error) { throw problem(400, error.message); }
-    const sessionId = randomUUID();
-    return python.call('create', {
-      task: pythonTaskRecord(config, sessionId), request: pythonRequest(config, token, sessionId),
-    });
   }
 
-  async function createPythonPool(input, saved) {
+  function createPool(input) {
     let config;
     try { config = validatePoolTaskConfig(input); }
     catch (error) { throw problem(400, error.message); }
-    const keys = saved ?? config.keyIds.map(findKey);
+    const keys = config.keyIds.map(findKey);
     if (new Set(keys.map(key => key.value)).size !== keys.length) throw problem(400, 'Key 池不能包含相同凭据');
-    if (!saved && keys.some(key => key.authStatus !== 'ready')) throw problem(400, '池成员须先通过鉴权');
-    const members = keys.map(key => {
-      const sessionId = randomUUID();
-      return { keyId: key.id, alias: key.alias, keyTail: key.value.slice(-4), baseUrl: key.baseUrl, sessionId,
-        attemptsMade: 0, successes: 0, disabled: false,
-        request: pythonRequest({ ...config, baseUrl: key.baseUrl }, key.value, sessionId) };
-    });
-    const task = pythonTaskRecord(config, randomUUID());
-    task.pool = { phase: 'racing', races: 1, members: members.map(({ request, ...member }) => member) };
-    return python.call('create', { task, members: members.map(({ keyId, request }) => ({ keyId, request })) });
+    if (keys.some(key => key.authStatus !== 'ready')) throw problem(400, '池成员须先通过鉴权');
+    try {
+      return engine.createPool(config, keys.map(key => ({ keyId: key.id, alias: key.alias, keyTail: key.value.slice(-4), baseUrl: key.baseUrl })));
+    } catch (error) { throw problem(400, error.message); }
   }
 
   function saveNotice(record) {
@@ -306,8 +298,7 @@ export async function startServer({
     const url = new URL(request.url, 'http://localhost');
     const path = url.pathname;
     if (path === '/api/health' && request.method === 'GET') {
-      const healthy = !closing && Boolean(python) && await python.call('health').catch(() => false);
-      reply(response, healthy ? 200 : 503, { ok: healthy, modelRequests: ['browser', 'python'], python: healthy }); return;
+      reply(response, closing ? 503 : 200, { ok: !closing }); return;
     }
     const sessionToken = /(?:^|;\s*)anyrouter_session=([A-Za-z0-9_-]{43})(?:;|$)/.exec(request.headers.cookie ?? '')?.[1] ?? '';
     const sessionId = digest(sessionToken).toString('hex');
@@ -341,10 +332,7 @@ export async function startServer({
       sessionCookie(response, '', 0);
       reply(response, 200, { authenticated: false }); return;
     }
-    const internalNotice = path === '/api/notifications' && request.method === 'POST' &&
-      ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress) &&
-      timingSafeEqual(internalDigest, digest(request.headers.authorization ?? ''));
-    if (path.startsWith('/api/') && !authenticated && !internalNotice) throw problem(401, '请先登录');
+    if (path.startsWith('/api/') && !authenticated) throw problem(401, '请先登录');
     if (path === '/api/keys') {
       if (request.method === 'GET') {
         reply(response, 200, db.prepare('SELECT payload FROM api_keys ORDER BY rowid DESC').all().map(row => JSON.parse(row.payload))); return;
@@ -379,45 +367,37 @@ export async function startServer({
         reply(response, 200, next); return;
       }
       if (request.method === 'DELETE') {
-        for (const task of await python.call('list')) {
-          if (task.config.keyId === record.id || task.config.keyIds?.includes(record.id)) await python.call('cancel', { id: task.id });
+        for (const task of engine.list()) {
+          if (task.config.keyId === record.id || task.config.keyIds?.includes(record.id)) engine.cancel(task.id);
         }
         db.prepare('DELETE FROM api_keys WHERE id=?').run(record.id);
         reply(response, 200, true); return;
       }
     }
-    if (path === '/api/python/models' && request.method === 'POST') {
-      const input = await jsonBody(request);
-      const key = findKey(input.keyId);
-      reply(response, 200, await python.call('models', { url: apiEndpoint(key.baseUrl, 'models'), token: key.value })); return;
+    if (path === '/api/models' && request.method === 'POST') {
+      const key = findKey((await jsonBody(request)).keyId);
+      reply(response, 200, await gateway.authenticate(key.value, key.baseUrl)); return;
     }
-    if (path === '/api/python/tasks') {
-      if (request.method === 'GET') { reply(response, 200, (await python.call('list', { detail: url.searchParams.get('detail') })).map(pythonView)); return; }
+    if (path === '/api/tasks') {
+      if (request.method === 'GET') {
+        const detail = url.searchParams.get('detail');
+        reply(response, 200, engine.list().map(task => taskView(task, task.id === detail))); return;
+      }
       if (request.method === 'POST') {
-        const input = await jsonBody(request);
-        if (input.config && 'keyIds' in input.config) {
-          reply(response, 201, pythonView(await createPythonPool(input.config))); return;
-        }
-        const key = findKey(input.config?.keyId);
-        reply(response, 201, pythonView(await createPythonTask({ ...input.config, baseUrl: key.baseUrl }, key.value))); return;
+        const { config } = await jsonBody(request);
+        reply(response, 201, taskView(config && 'keyIds' in config ? createPool(config) : createTask(config))); return;
       }
     }
-    const pythonTask = path.match(/^\/api\/python\/tasks\/(python_[a-f0-9-]{36})(?:\/(pause|resume|retryNow|cancel|restart))?$/);
-    if (pythonTask) {
-      const [, id, action] = pythonTask;
-      if (request.method === 'DELETE' && !action) { reply(response, 200, await python.call('remove', { id })); return; }
-      if (request.method === 'POST' && action) {
-        if (action === 'restart') {
-          const source = await python.call('restart', { id });
-          if (source.task.pool) {
-            const keys = source.task.pool.members.map(member => ({ id: member.keyId, alias: member.alias, baseUrl: member.baseUrl,
-              value: source.members.find(item => item.keyId === member.keyId).request.headers.Authorization.slice(7) }));
-            reply(response, 201, pythonView(await createPythonPool(source.task.config, keys))); return;
-          }
-          reply(response, 201, await createPythonTask(source.task.config, source.request.headers.Authorization.slice(7)));
-        } else reply(response, 200, await python.call(action, { id }));
-        return;
+    const taskPath = path.match(/^\/api\/tasks\/(task_[a-f0-9-]{36})(?:\/(pause|resume|retryNow|cancel|restart))?$/);
+    if (taskPath) {
+      const [, id, action] = taskPath;
+      const source = engine.get(id);
+      if (!source) throw problem(404, '服务端任务不存在');
+      if (request.method === 'DELETE' && !action) { reply(response, 200, engine.remove(id)); return; }
+      if (request.method === 'POST' && action === 'restart') {
+        reply(response, 201, taskView('keyIds' in source.config ? createPool(source.config) : createTask(source.config))); return;
       }
+      if (request.method === 'POST' && action) { reply(response, 200, engine[action](id)); return; }
     }
     if (path === '/api/notifications' && request.method === 'POST') {
       const record = enqueue(notificationPayload(await jsonBody(request)));
@@ -446,24 +426,40 @@ export async function startServer({
     response.end(request.method === 'HEAD' ? undefined : content);
   }
 
+  engine = new ServerTaskEngine({
+    now,
+    getKey: id => { const row = keyById.get(id); return row && JSON.parse(row.payload).value; },
+    notificationClient: {
+      async enqueue(payload) { const record = enqueue(notificationPayload(payload)); void tick(); return notificationView(record); },
+      async get(id) {
+        const record = findNotice(id);
+        if (!record) throw new NotificationReadError('通知回执不存在', 404);
+        return notificationView(record);
+      },
+    },
+    onChange: () => {
+      saveTimer ??= setTimeout(() => {
+        try { saveTasks(); } catch { console.error('Failed to save server tasks; check the local database.'); }
+      }, TASK_SAVE_MS);
+    },
+  });
+  engine.restoreServer([...savedTasks.values()].map(payload => JSON.parse(payload)));
+
   const server = createServer((request, response) => {
     void handle(request, response).catch(error => {
       if (response.destroyed || response.writableEnded) return;
       if (response.headersSent) { response.destroy(); return; }
-      reply(response, error.status ?? 500, { error: error.status ? error.message : '本地服务操作失败，请检查 Python 进程和数据目录' });
+      reply(response, error.status ?? 500, { error: error.status ? error.message : '本地服务操作失败，请检查数据目录' });
     });
   });
   try {
     await new Promise((accept, reject) => {
       server.once('error', reject); server.listen(port, host, accept);
     });
-  } catch (error) { db.close(); throw error; }
+  } catch (error) { engine.dispose(); clearTimeout(saveTimer); db.close(); throw error; }
   const boundAddress = server.address().address;
   const localHost = boundAddress === '0.0.0.0' ? '127.0.0.1' : boundAddress === '::' ? '[::1]' :
     boundAddress.includes(':') ? `[${boundAddress}]` : boundAddress;
-  python = new PythonBridge(join(dirname(resolve(dbPath)), 'python-tasks.sqlite'), `http://${localHost}:${server.address().port}/api/notifications`, internalAuthorization);
-  try { await python.ready; }
-  catch (error) { await python.close(); server.closeAllConnections(); await new Promise(resolveClose => server.close(resolveClose)); db.close(); throw error; }
   timer = setInterval(() => void tick(), 1000);
   void tick();
   return {
@@ -471,7 +467,8 @@ export async function startServer({
     async close() {
       if (closing) return;
       closing = true; clearInterval(timer);
-      await python.close();
+      engine.dispose();
+      saveTasks();
       const work = [...deliveries.values()];
       for (const active of work) active.controller.abort();
       server.closeAllConnections();
@@ -491,7 +488,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       origin: process.env.ANYROUTER_ORIGIN, password: process.env.ANYROUTER_PASSWORD,
       dbPath: join(process.env.ANYROUTER_DATA_DIR || join(ROOT, 'data'), 'notifications.sqlite') });
     console.log(`AnyRouter console: ${process.env.ANYROUTER_ORIGIN || app.url}`);
-    console.log('Browser and Python schedulers can run together. Press Ctrl+C to stop the service.');
+    console.log('Browser and server schedulers can run together. Press Ctrl+C to stop the service.');
     for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => void app.close());
   } catch (error) {
     console.error(error.message); process.exitCode = 1;

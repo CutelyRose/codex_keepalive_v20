@@ -1,6 +1,6 @@
 # 双端调度实现
 
-界面源于 2026-09-18 的 AnyRouter 公开前端，当前增加 Python 调度和持续保活，使用同一个任务表单与状态结构。
+界面源于 2026-09-18 的 AnyRouter 公开前端，当前增加服务端调度和持续保活，使用同一个任务表单与状态结构。
 
 ## 执行链路
 
@@ -11,10 +11,10 @@ flowchart LR
   Browser -->|HTTP / SSE| API[模型服务]
   Store -->|同源任务 API| Node[Node 本地服务]
   Node --> Keys[服务器 Key 数据库]
-  Node -->|stdio JSON| Python[Python WebRuntime]
-  Python -->|HTTP / SSE| API
+  Node --> Server[ServerTaskEngine]
+  Server -->|HTTP / SSE| API
   Browser --> Notice[持久化通知队列]
-  Python --> Notice
+  Server --> Notice
   Notice --> Telegram[Telegram Bot API]
   Notice --> ServerChan[Server 酱 API]
   Notice --> ShowDoc[ShowDoc 推送 API]
@@ -28,24 +28,21 @@ AppStore 合并两端任务。ID 与 scheduler 标识执行者，操作路由到
 | src/core/api-client.ts | 同源 Cookie 请求与登录失效处理 |
 | src/components/login-screen.ts | 管理密码登录页 |
 | src/core/task-config.ts | 浏览器引擎与服务端共用的任务验证 |
-| src/live/live-task-engine.ts | 浏览器探活、并发流、保活和通知 |
-| src/live/python-task-engine.ts | Python API 客户端和状态同步 |
+| src/live/live-task-engine.ts | 两端共用的探活轮次、并发流、保活和通知；`runLane` 处理单个 HTTP / SSE 请求 |
+| src/live/server-task-engine.ts | 服务端调度：重启恢复、8 个轮次上限、Key 池状态机 |
+| src/live/server-task-client.ts | 浏览器访问服务端任务接口和状态同步 |
 | src/live/request-builders.ts | 共用 GPT / Claude 请求构造 |
-| python-bridge.mjs | Python 子进程及 stdio 请求响应关联 |
-| python_scheduler.py | 根目录 codex_tasks.Runtime 的网页适配、HTTP 轮次和持久化 |
-| python_pool.py | 池成员调度、唯一保活成员、30 秒截止与状态恢复 |
-| python_transport.py | 两种 Python 任务共用的 HTTP/SSE 请求、取消及错误分类 |
-| server.mjs | 登录会话、Key 持久化、静态文件、Python 任务接口和通知队列 |
+| server.mjs | 登录会话、Key 与任务持久化、静态文件、服务端任务接口和通知队列 |
 
-Python 复用根目录调度器管理轮次、时间、并发占位和修订号；适配层处理并发 HTTP / SSE 及网页状态。根目录终端入口保持独立可用。
+服务端普通任务直接运行 `LiveTaskEngine`，与浏览器端是同一份代码；`ServerTaskEngine` 只增加服务端特有的恢复、限流和 Key 池。根目录 Python 终端程序与网页无关，保持独立可用。
 
-构建时将请求构造、验证和 URL 规范化输出至 `dist/task-requests.mjs`。Node 用同一份构造函数为 Python 创建请求快照，GPT / Claude 请求体和工具定义没有另写 Python 版本。
+构建时将验证、URL 规范化、鉴权和 `ServerTaskEngine` 输出至 `dist/server-core.mjs`，由 `server.mjs` 加载。两端每次请求都用同一份构造函数生成 GPT / Claude 请求体和工具定义。
 
 ## 请求与调度
 
 接口为 `/v1/models`、`/v1/responses`、`/v1/messages?beta=true`。Base URL 支持服务根地址或 `/v1`，拒绝用户名密码、查询参数及具体接口地址。
 
-Python 鉴权和模型请求统一使用 urllib 的系统代理规则，支持 HTTP_PROXY、HTTPS_PROXY 和 NO_PROXY。模型请求保留连接取消及首事件超时控制。
+服务端以 `node --use-env-proxy` 启动，鉴权、模型请求和通知投递统一读取 HTTP_PROXY、HTTPS_PROXY 和 NO_PROXY，代理通过 CONNECT 隧道转发；Windows 系统代理设置需要写成环境变量。模型请求保留连接取消及首事件超时控制。
 
 GPT 头部与请求体见 `codex-contract.ts`，Claude 请求及 26 个工具定义见 `claude-contract.ts` 与 `contracts/claude-code-2.1.231-tools.json`。工具定义仅作为协议数据发送，不在本机执行。
 
@@ -76,21 +73,21 @@ healthy 保存最近轮次是否成功；attemptsMade 是累计实际请求数�
 
 保活间隔按发送时间计算，前一轮未结束时不积累补发。失败后等待配置间隔与 Retry-After 中较晚的时间。探活按 min(并发数, 剩余预算) 发送，首个成功者中断其他流。
 
-Python 最多同时执行 8 个轮次，未返回的物理请求仍占用位置。暂停、取消、删除中断已建立的连接，修订号阻止旧结果更改后续状态。
+服务端最多同时执行 8 个轮次（`MAX_SERVER_ROUNDS`），未返回的物理请求仍占用位置；超出时任务按先后排队，空出位置立即开始。最多保存 128 个任务。暂停、取消、删除中断已建立的连接，轮次版本阻止旧结果更改后续状态。浏览器端没有轮次上限。
 
-### Python Key 池
+### 服务端 Key 池
 
-池配置与普通任务配置明确区分：池传 `keyIds: string[]`，至少两个不同 Key；不接受 `keyId`、`baseUrl` 或 `maxAttempts`，`keepalive` 固定为 `true`。其余模型、提示词、时间、每 Key 并发及通知字段共用验证。Node 按成员从服务器读取 Key 和服务地址，使用现有请求构造器为每个成员生成独立会话与请求快照。拒绝不同记录引用相同凭据的池。
+池配置与普通任务配置明确区分：池传 `keyIds: string[]`，至少两个不同 Key；不接受 `keyId`、`baseUrl` 或 `maxAttempts`，`keepalive` 固定为 `true`。其余模型、提示词、时间、每 Key 并发及通知字段共用验证。创建时按成员读取服务器 Key 的服务地址，每个成员生成独立会话；请求发出时按 Key ID 读取凭据。拒绝不同记录引用相同凭据或未通过鉴权的成员。
 
 公开任务包含 `pool: {phase, activeKeyId?, recoveryDeadline?, races, members}`；阶段为 `racing / keeping / recovering`，成员包含 Key ID、别名、尾号、地址、会话、计数和最近错误，不包含请求头或凭据。任务概要仍省略流摘要和事件；成员详情可直接随概要显示。
 
-一个池占一个根调度器并发位置，成员并发在池内展开。`WebRuntime.step` 在同一把调度锁内推进池状态，并使用根调度器的扩展入口避免池再次被当作普通任务发送。等待重试时释放位置，尚未结束的物理请求保持占位；30 秒到期时可在原池位置启动新竞争，不等待旧连接收尾。
+一个池占一个轮次位置，成员并发在池内展开。等待重试时释放位置，尚未结束的物理请求保持占位；30 秒到期时可在原池位置启动新竞争，不等待旧连接收尾。
 
-成功流事件在调度锁内确认唯一胜者并取消其他成员。成员每轮有独立请求集合，失败只影响对应成员；永久错误停用该成员。池内部轮次版本与取消标志阻止旧事件更改胜者，旧线程结束后仍会清理连接和占位。正常保活只有一个请求，恢复阶段只有原成员按配置并发重新探活。
+Node 单线程处理流事件，首个成功事件确认唯一胜者并同步取消其他成员。成员每轮有独立请求集合，失败只影响对应成员；永久错误停用该成员。池内部轮次版本阻止旧事件更改胜者，被取消的请求结束后仍会清理连接和占位。正常保活只有一个请求，恢复阶段只有原成员按配置并发重新探活。
 
-首次失败／异常断流确定恢复截止点，后续失败或立即请求不重置。调度 tick 和流事件处理都先检查截止点，以单调时钟判断 30 秒边界。到期清除旧保活资格并全池竞争；每成员 `Retry-After` 保留，未到时间的成员等待到期再参与。
+首次失败／异常断流确定恢复截止点，后续失败或立即请求不重置。截止计时器、调度 tick 和每个流事件都先检查截止点，同一时刻截止优先。到期清除旧保活资格并全池竞争；每成员 `Retry-After` 保留，未到时间的成员等待到期再参与。
 
-池及成员作为同一 SQLite 记录保存，沿用 Windows DPAPI 和其他平台的数据目录权限。重启时全池竞争继续；保活状态先由原成员进入新的 30 秒验证期；已在恢复期则沿用原绝对截止时间，停机时间计入。暂停和终态不启动。每个成员的会话在保活、竞争和重启后保持不变，重新开始任务生成新会话。
+池及成员作为同一条任务记录保存。重启时全池竞争继续；保活状态先由原成员进入新的 30 秒验证期；已在恢复期则沿用原绝对截止时间，停机时间计入。暂停和终态不启动。每个成员的会话在保活、竞争和重启后保持不变，重新开始任务生成新会话。
 
 单流限制 2 MiB、摘要 8 KiB、事件 200 条；空闲上限 60 秒、总时限 10 分钟。无效 Key、模型和额度错误停止任务；HTTP 408/409/425/429/500/502/503/504/529 可重试。
 
@@ -98,7 +95,7 @@ Python 最多同时执行 8 个轮次，未返回的物理请求仍占用位置�
 
 服务默认监听 127.0.0.1。远程部署显式配置监听地址、站点 Origin 和管理密码，校验 Host / Origin。页面和资源公开，业务 API 要求登录；本机未配置密码时可直接访问。管理密码使用恒定时间摘要比较，同一来源在一分钟内连续失败 5 次后返回 429。
 
-登录后颁发随机 Cookie，包含 HttpOnly、SameSite=Strict、Path=/ 和 7 天有效期；配置 HTTPS Origin 时增加 Secure。服务端内存只保存令牌摘要与过期时间，退出会撤销对应会话，服务重启后需要重新登录。不再支持 HTTP Basic。Python stdio 不对网络开放，通知回调使用每次启动生成的专用 Bearer 凭证，仅允许本机 POST 通知接口，并绕过系统代理。
+登录后颁发随机 Cookie，包含 HttpOnly、SameSite=Strict、Path=/ 和 7 天有效期；配置 HTTPS Origin 时增加 Secure。服务端内存只保存令牌摘要与过期时间，退出会撤销对应会话，服务重启后需要重新登录。不再支持 HTTP Basic。服务端任务在进程内直接写入通知队列，通知接口没有免登录入口。
 
 | 接口 | 输入 / 结果 |
 | --- | --- |
@@ -108,46 +105,44 @@ Python 最多同时执行 8 个轮次，未返回的物理请求仍占用位置�
 | GET /api/keys | 已登录客户端共享的 KeyRecord 列表 |
 | POST /api/keys | {alias, value, baseUrl}；迁移时可带原 id、鉴权结果和模型缓存，同 ID 不覆盖已存凭据 |
 | PATCH /api/keys/{id} | {baseUrl} 修改地址并清空模型缓存；或 {expectedBaseUrl, auth: AuthResult} 保存鉴权结果 |
-| DELETE /api/keys/{id} | 取消关联 Python 普通任务及整个关联池，并删除 Key |
+| DELETE /api/keys/{id} | 取消关联的服务端普通任务及整个关联池，并删除 Key |
 
 Key 存在 `data/notifications.sqlite` 的 `api_keys` 表，沿用服务器受限数据目录。Key 原文只对已登录的管理界面开放，供浏览器直接请求模型服务；前端不再持久化 Key。首次进入工作区时导入当前浏览器 Key，保留 ID；全部写入成功才清除原副本，重复导入按 ID 去重。地址变更后拒绝保存基于旧地址的鉴权结果。列表在工作区加载、进入 Key / 新建任务页面及手动刷新时读取。
 
-## Python 接口
+## 服务端任务接口
 
 | 接口 | 输入 / 结果 |
 | --- | --- |
-| GET /api/health | 无需认证；检查 Python 调度线程，失败返回 503 |
-| POST /api/python/models | {keyId}，从服务器读取 Key 和地址，由 Python 鉴权并读取模型 |
-| GET /api/python/tasks | 任务概要，events 与 responseSummary 为空；不返回模型 Key、ShowDoc 推送 URL、Bot Token 或 SendKey |
-| GET /api/python/tasks?detail={id} | 仅指定任务携带事件和响应摘要 |
-| POST /api/python/tasks | {config: TaskConfig 或 PoolTaskConfig}，按 keyId 或 keyIds 读取服务器凭据和地址，创建普通任务或池 |
-| POST /api/python/tasks/{id}/pause | 暂停 |
-| POST /api/python/tasks/{id}/resume | 继续 |
-| POST /api/python/tasks/{id}/retryNow | 跳过等待，立即请求 |
-| POST /api/python/tasks/{id}/cancel | 取消 |
-| POST /api/python/tasks/{id}/restart | 用后台快照创建新任务，不向页面暴露 Key |
-| DELETE /api/python/tasks/{id} | 停止并删除任务记录 |
+| GET /api/health | 无需认证；返回 `{ok}`，服务关闭中返回 503 |
+| POST /api/models | {keyId}，从服务器读取 Key 和地址，由服务端鉴权并读取模型，返回 AuthResult |
+| GET /api/tasks | 任务概要，events 与 responseSummary 为空；不返回模型 Key、ShowDoc 推送 URL、Bot Token 或 SendKey |
+| GET /api/tasks?detail={id} | 仅指定任务携带事件和响应摘要 |
+| POST /api/tasks | {config: TaskConfig 或 PoolTaskConfig}，按 keyId 或 keyIds 读取服务器凭据和地址，创建普通任务或池 |
+| POST /api/tasks/{id}/pause | 暂停 |
+| POST /api/tasks/{id}/resume | 继续 |
+| POST /api/tasks/{id}/retryNow | 跳过等待，立即请求 |
+| POST /api/tasks/{id}/cancel | 取消 |
+| POST /api/tasks/{id}/restart | 用服务端保存的配置和当前 Key 创建新任务，不向页面暴露 Key；Key 已删除时返回 404 |
+| DELETE /api/tasks/{id} | 停止并删除任务记录 |
 
-前端约每 1.5 秒同步 Python 状态，打开抽屉立即读取该任务详情，关闭后恢复概要同步。旧读取不能覆盖更新后的操作结果。关闭页面仅停止同步，不发送任务停止命令。浏览器任务直接请求模型服务，遵守 CORS 规则。
+前端约每 1.5 秒同步服务端状态，打开抽屉立即读取该任务详情，关闭后恢复概要同步。旧读取不能覆盖更新后的操作结果。关闭页面仅停止同步，不发送任务停止命令。浏览器任务直接请求模型服务，遵守 CORS 规则。
 
 ## 保存与恢复
 
 浏览器使用 anyrouter-console: localStorage 保存任务、默认设置和主题。普通流事件按 250 ms 合并保存，关键状态即时保存；离开页面时刷新待写状态。活动任务刷新后暂停；已成功的一次性流中断后保持终态。
 
-Python 使用 `data/python-tasks.sqlite` 保存任务、事件、计数和连接快照，复用受调度锁保护的 SQLite 连接并启用 WAL。Windows 复用根目录 DPAPI；Linux/macOS 目录权限 700、数据库权限 600。重启恢复启用任务，暂停和终态不自动启动；已确认成功的一次性任务不重复请求。
-
-Node 管理一个 Python 进程。退出时先保存状态，再终止请求。可通过 ANYROUTER_PYTHON 指定解释器。
+服务端任务保存在 `data/notifications.sqlite` 的 `tasks` 表，与 Key、通知共用一个 WAL 连接。状态变化后最多 1 秒合并写入一次，只写有变化的任务；退出时先停止请求再写入全部状态。任务只保存 Key ID，不保存凭据副本，上游错误或流内容中回显的 Key 替换为 `[redacted]`。数据目录权限 700、数据库权限 600。重启恢复启用任务，暂停和终态不自动启动；已确认成功的一次性任务不重复请求。
 
 ## 通知与验证
 
 两端向 POST /api/notifications 提交成功摘要，以“任务 ID:成功时间”去重；GET /api/notifications/{id} 返回回执。首次成功或失败后恢复成功时通知，持续成功不重复发送，冷却 300 秒。
 
-通知保存于 `data/notifications.sqlite`，状态 queued / retrying / sent / dead；内存只保存未完成通知，最多并行投递 4 条。每条最多尝试 5 次，遵守 Telegram retry_after 或 ShowDoc / Server 酱 HTTP Retry-After，否则按 2/4/8/16 秒退避。永久错误停止重试。结束后清除 ShowDoc 推送 URL、Bot Token、Chat ID、SendKey；历史回执按主键读取。Python 状态接口合并最新通知回执。
+通知保存于 `data/notifications.sqlite`，状态 queued / retrying / sent / dead；内存只保存未完成通知，最多并行投递 4 条。每条最多尝试 5 次，遵守 Telegram retry_after 或 ShowDoc / Server 酱 HTTP Retry-After，否则按 2/4/8/16 秒退避。永久错误停止重试。结束后清除 ShowDoc 推送 URL、Bot Token、Chat ID、SendKey；历史回执按主键读取。两端引擎按同一方式轮询回执并更新任务状态。
 
 通知表单默认选择 ShowDoc，切换方式只显示相应参数，隐藏字段禁用并从提交内容中排除。ShowDoc 配置字段为 `showdocPushUrl`，通知队列输入字段为 `showdocUrl`；仅接受官方 `https://push.showdoc.com.cn/server/api/push/<推送密钥>` 地址。按 [ShowDoc 官方推送服务](https://push.showdoc.com.cn/)的调用方式，以表单 POST `title / content`；HTTP 成功且 `error_code === 0` 才标记 sent，业务错误读取 `error_message`。推送 URL 与其中的密钥参与日志脱敏。
 
-Server 酱请求与官方 serverchan-sdk 1.0.6 的 sc_send 协议一致：SCT 使用 `https://sctapi.ftqq.com/{sendkey}.send`；sctp 使用 `https://{uid}.push.ft07.com/send/{sendkey}.send`。Node 直接 POST JSON `title / desp / tags`，无需为共享队列增加 Python SDK 依赖。标题限 32 个 Unicode 字符，成功必须 HTTP 成功且 code 为 0，存在 data.errno 时也必须为 0。
+Server 酱请求与官方 serverchan-sdk 1.0.6 的 sc_send 协议一致：SCT 使用 `https://sctapi.ftqq.com/{sendkey}.send`；sctp 使用 `https://{uid}.push.ft07.com/send/{sendkey}.send`。Node 直接 POST JSON `title / desp / tags`，无需增加 SDK 依赖。标题限 32 个 Unicode 字符，成功必须 HTTP 成功且 code 为 0，存在 data.errno 时也必须为 0。
 
-Docker / 1Panel 配置及单实例部署边界见 [DEPLOY.md](../DEPLOY.md)；性能数据见 [PERFORMANCE.md](PERFORMANCE.md)。镜像支持 amd64 / arm64，工作流在发布 latest 前检查容器认证和 SQLite 重启恢复。浏览器 UUID 统一通过 `crypto.getRandomValues` 生成，支持通过 HTTP 的服务器 IP 直接访问。
+Docker / 1Panel 配置及单实例部署边界见 [DEPLOY.md](../DEPLOY.md)。镜像支持 amd64 / arm64，工作流在发布 latest 前检查容器认证和 SQLite 重启恢复。浏览器 UUID 统一通过 `crypto.getRandomValues` 生成，支持通过 HTTP 的服务器 IP 直接访问。
 
-`npm run check` 检查类型。`npm test` 使用独立临时数据和本机 HTTP 服务验证协议、SSE 首事件成功、系统代理、双端超过 16 个请求的并发、大数值配置保存、保活恢复、稳定会话、暂停删除、Python 重启恢复、三种通知平台、登录过期与退出、Key 迁移和共享持久化、概要与详情及浏览器写入合并，不访问真实上游。
+`npm run check` 检查类型。`npm test` 使用独立临时数据和本机 HTTP 服务验证协议、SSE 首事件成功、环境变量代理、双端超过 16 个请求的并发、大数值配置保存、保活恢复、稳定会话、暂停删除、服务端重启恢复、Key 池可控时钟边界和轮次上限、三种通知平台、登录过期与退出、Key 迁移和共享持久化、概要与详情及浏览器写入合并，不访问真实上游。

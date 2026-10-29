@@ -1,5 +1,5 @@
 export type Channel = 'gpt' | 'claude';
-export type Scheduler = 'browser' | 'python';
+export type Scheduler = 'browser' | 'server';
 export type SchedulerChoice = Scheduler | 'both';
 export interface NotificationSettings {
   showdocPushUrl?: string;
@@ -62,9 +62,9 @@ export interface PoolMember {
   attemptsMade: number;
   successes: number;
   disabled: boolean;
-  status: 'racing' | 'keeping' | 'recovering' | 'standby' | 'disabled' | 'paused';
   lastError?: string;
   nextAttemptAt?: number;
+  retryAfterAt?: number;
 }
 export interface PoolState {
   phase: 'racing' | 'keeping' | 'recovering';

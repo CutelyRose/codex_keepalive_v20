@@ -13,7 +13,11 @@ await build({
 });
 await copyFile('index.html', 'dist/index.html');
 await build({
-  stdin: { contents: "export * from './src/live/request-builders'; export * from './src/core/task-config'; export * from './src/core/api-url';", resolveDir: process.cwd() },
-  bundle: true, platform: 'node', format: 'esm', target: 'node22', outfile: 'dist/task-requests.mjs',
+  stdin: { contents: [
+    "export * from './src/core/task-config';", "export * from './src/core/api-url';",
+    "export { ServerTaskEngine } from './src/live/server-task-engine';", "export { AnyRouterGateway } from './src/live/anyrouter-gateway';",
+    "export { NotificationReadError } from './src/live/notification-client';",
+  ].join('\n'), resolveDir: process.cwd() },
+  bundle: true, platform: 'node', format: 'esm', target: 'node22', outfile: 'dist/server-core.mjs',
 });
 console.log('Built browser console.');

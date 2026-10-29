@@ -4,6 +4,8 @@ import type {
   NotificationClient,
   NotificationPayload,
   NotificationReceipt,
+  PoolMember,
+  Scheduler,
   Task,
   TaskConfig,
   TaskEvent,
@@ -29,8 +31,11 @@ import { apiHost } from '../core/api-url';
 
 type TimerHandle = ReturnType<typeof globalThis.setTimeout>;
 
+/** Longest delay setTimeout accepts; larger values fire immediately. */
+export const MAX_TIMER_MS = 2_147_483_647;
+
 /** One parallel probe inside a round. It owns its own timers and abort handle. */
-interface AttemptLane {
+export interface AttemptLane {
   controller: AbortController;
   firstEventTimer?: TimerHandle;
   totalTimer?: TimerHandle;
@@ -41,22 +46,35 @@ interface AttemptLane {
   summary: string;
 }
 
-/** Shared state for one round of parallel lanes. */
-interface RoundState {
+/** Shared state for one round of parallel lanes; Key pools run one round per member. */
+export interface RoundState {
   won: boolean;
   lanes: AttemptLane[];
+  /** A one-lane ordinary round streams straight into the task summary. */
+  solo: boolean;
+  /** Request settings; pool members use their own address and session. */
+  config: TaskConfig;
+  sessionId: string;
+  token?: string;
+  /** Pool rounds keep task history to scheduling events. */
+  quiet: boolean;
+  current(): boolean;
+  /** Claims the success for `lane`; called once, before any other lane can win. */
+  win(lane: AttemptLane, type: string): void;
 }
 
-interface LaneResult {
-  /** This lane saw the success event; the round is won and no failure is reported. */
+export interface LaneResult {
+  /** This lane saw the success event; `detail` is then the interruption reason. */
   accepted: boolean;
+  /** The owner stopped or another lane won; nothing should be reported. */
+  stale?: boolean;
   detail?: string;
   retryable?: boolean;
   retryAfterMs?: number;
   sawEvent?: boolean;
 }
 
-interface TaskRuntime {
+export interface TaskRuntime {
   generation: number;
   retryTimer?: TimerHandle;
   lanes: Set<AttemptLane>;
@@ -72,6 +90,7 @@ export interface LiveTaskEngineOptions {
   onChange?: (immediate: boolean) => void;
   now?: () => number;
   buildRequest?: (config: TaskConfig, token: string, sessionId: string) => BuiltRequest;
+  scheduler?: Scheduler;
 }
 
 /**
@@ -80,15 +99,16 @@ export interface LiveTaskEngineOptions {
  */
 export class LiveTaskEngine {
   readonly tasks = new Map<string, Task>();
-  private readonly runtimes = new Map<string, TaskRuntime>();
-  private readonly getKey: LiveTaskEngineOptions['getKey'];
+  protected readonly runtimes = new Map<string, TaskRuntime>();
+  protected readonly getKey: LiveTaskEngineOptions['getKey'];
   private readonly fetchImpl: typeof fetch;
   private readonly notificationClient: NotificationClient;
   private readonly notificationPollMs: number;
   private readonly onChange: (immediate: boolean) => void;
-  private readonly now: () => number;
+  protected readonly now: () => number;
   private readonly buildRequest: NonNullable<LiveTaskEngineOptions['buildRequest']>;
-  private disposed = false;
+  protected readonly scheduler: Scheduler;
+  protected disposed = false;
   private readonly onPollEnvironmentChange = (): void => {
     for (const task of this.tasks.values()) {
       const runtime = this.runtimes.get(task.id);
@@ -108,6 +128,7 @@ export class LiveTaskEngine {
     this.onChange = options.onChange ?? (() => undefined);
     this.now = options.now ?? (() => Date.now());
     this.buildRequest = options.buildRequest ?? ((config, token, sessionId) => buildTaskRequest(config, token, { sessionId }));
+    this.scheduler = options.scheduler ?? 'browser';
     globalThis.addEventListener?.('online', this.onPollEnvironmentChange);
     globalThis.addEventListener?.('offline', this.onPollEnvironmentChange);
     globalThis.document?.addEventListener('visibilitychange', this.onPollEnvironmentChange);
@@ -152,7 +173,7 @@ export class LiveTaskEngine {
     const now = this.now();
     const task: Task = {
       id: makeId('task'),
-      scheduler: 'browser',
+      scheduler: this.scheduler,
       sessionId: randomUUID(),
       config: { ...config },
       status: 'running',
@@ -170,7 +191,7 @@ export class LiveTaskEngine {
     };
     this.tasks.set(task.id, task);
     this.runtimes.set(task.id, { generation: 0, lanes: new Set() });
-    this.addEvent(task, 'task.created', '任务已创建', '浏览器独立调度器已启动。', 'info');
+    this.addEvent(task, 'task.created', '任务已创建', `${this.scheduler === 'server' ? '服务端' : '浏览器'}独立调度器已启动。`, 'info');
     this.emit();
     this.scheduleAttempt(task, 0);
     return task;
@@ -267,7 +288,7 @@ export class LiveTaskEngine {
     globalThis.document?.removeEventListener('visibilitychange', this.onPollEnvironmentChange);
   }
 
-  private scheduleAttempt(task: Task, delayMs: number): void {
+  protected scheduleAttempt(task: Task, delayMs: number): void {
     if (this.disposed || !isSchedulableStatus(task.status) || isAcceptedStatus(task.status)) return;
     const runtime = this.ensureRuntime(task.id);
     if (runtime.retryTimer) globalThis.clearTimeout(runtime.retryTimer);
@@ -279,7 +300,7 @@ export class LiveTaskEngine {
     runtime.retryTimer = globalThis.setTimeout(() => {
       runtime.retryTimer = undefined;
       void this.beginAttempt(task.id);
-    }, delayMs);
+    }, Math.min(MAX_TIMER_MS, delayMs));
   }
 
   /**
@@ -288,7 +309,7 @@ export class LiveTaskEngine {
    * When no lane succeeds, the round reports exactly one failure and the normal retry cadence
    * resumes. `concurrency: 1` degenerates to the original single-probe behaviour.
    */
-  private async beginAttempt(id: string): Promise<void> {
+  protected async beginAttempt(id: string): Promise<void> {
     const task = this.tasks.get(id);
     const runtime = this.runtimes.get(id);
     if (
@@ -306,7 +327,11 @@ export class LiveTaskEngine {
     const token = this.getKey(task.config.keyId)?.trim();
     const generation = ++runtime.generation;
     const laneCount = task.healthy ? 1 : Math.min(task.config.concurrency, task.config.maxAttempts - task.probeAttempts);
-    const round: RoundState = { won: false, lanes: [] };
+    const round: RoundState = {
+      won: false, lanes: [], solo: laneCount === 1, config: task.config, sessionId: task.sessionId, token, quiet: false,
+      current: () => this.isCurrent(task, generation),
+      win: (lane, type) => { winRound(round, lane); this.accept(task, type, token as string); },
+    };
 
     task.status = 'requesting';
     task.nextAttemptAt = undefined;
@@ -331,13 +356,23 @@ export class LiveTaskEngine {
     }
     this.emit();
 
-    const results = await Promise.all(
-      round.lanes.map((lane) => this.runLane(task, runtime, generation, token, lane, round)),
-    );
+    const results = await Promise.all(round.lanes.map((lane) => this.runLane(task, runtime, round, lane)));
 
     if (this.disposed || !this.isCurrent(task, generation)) return;
     if (round.won) {
-      if (task.config.keepalive && isAcceptedStatus(task.status)) {
+      const detail = results.find((result) => result.accepted)?.detail;
+      task.completedAt = this.now();
+      task.updatedAt = this.now();
+      task.lastError = detail;
+      if (detail === undefined) {
+        task.status = 'accepted-completed';
+        this.addEvent(task, 'stream.completed', '响应流已结束', '成功连接已正常读取至结束。', 'success');
+      } else {
+        task.status = 'accepted-stream-interrupted';
+        this.addEvent(task, 'stream.interrupted', '流已中断', `${detail}；成功信号已经确认，不会重新请求模型。`, 'warning');
+      }
+      this.emit();
+      if (task.config.keepalive) {
         const seconds = task.config.keepaliveMinSeconds + Math.random() * (task.config.keepaliveMaxSeconds - task.config.keepaliveMinSeconds);
         task.status = 'keepalive';
         task.completedAt = undefined;
@@ -346,8 +381,6 @@ export class LiveTaskEngine {
       }
       return;
     }
-    if (isAcceptedStatus(task.status)) return;
-
     const failures = results.flatMap((result) => (result.detail ? [result] : []));
     const detail = failures.length
       ? roundFailureDetail(failures.map((failure) => failure.detail as string))
@@ -362,15 +395,12 @@ export class LiveTaskEngine {
     );
   }
 
-  private async runLane(
-    task: Task,
-    runtime: TaskRuntime,
-    generation: number,
-    token: string | undefined,
-    lane: AttemptLane,
-    round: RoundState,
-  ): Promise<LaneResult> {
-    const controller = lane.controller;
+  /** Runs one physical request; the round decides who owns success and where the stream is recorded. */
+  protected async runLane(task: Task, runtime: TaskRuntime, round: RoundState, lane: AttemptLane): Promise<LaneResult> {
+    const { controller } = lane;
+    const { config, token } = round;
+    // Upstreams may echo the credential in errors or stream text; it never reaches task state.
+    const hide = (text: string): string => token ? text.replaceAll(token, '[redacted]') : text;
     let timeoutDetail: string | undefined;
     let accepted = false;
     let sawEvent = false;
@@ -384,12 +414,12 @@ export class LiveTaskEngine {
     try {
       if (!token) throw new ModelRequestError('本地 Key 已不存在或为空', false);
       let request: BuiltRequest;
-      try { request = this.buildRequest(task.config, token, task.sessionId); }
+      try { request = this.buildRequest(config, token, round.sessionId); }
       catch (error) { throw new ModelRequestError(errorMessage(error), false); }
       lane.firstEventTimer = globalThis.setTimeout(() => {
-        timeoutDetail = `成功首事件超时（${task.config.timeoutSeconds} 秒）`;
+        timeoutDetail = `成功首事件超时（${config.timeoutSeconds} 秒）`;
         controller.abort();
-      }, task.config.timeoutSeconds * 1_000);
+      }, config.timeoutSeconds * 1_000);
       lane.totalTimer = globalThis.setTimeout(() => {
         timeoutDetail = '完整响应超过 10 分钟总期限';
         controller.abort();
@@ -403,9 +433,9 @@ export class LiveTaskEngine {
         cache: 'no-store',
       });
       if (!response.ok) {
-        const detail = await responseError(response);
+        const detail = hide(await responseError(response));
         throw new ModelRequestError(
-          `${apiHost(task.config.baseUrl)} · ${detail}`,
+          `${apiHost(config.baseUrl)} · ${detail}`,
           retryableModelError(detail, response.status),
           retryAfterMilliseconds(response.headers.get('Retry-After'), this.now()),
         );
@@ -414,14 +444,14 @@ export class LiveTaskEngine {
       armIdleTimer();
 
       await readSseStream(response.body, async (event) => {
-        if (lane.superseded || !this.isCurrent(task, generation)) {
+        if (lane.superseded || !round.current()) {
           throw new DOMException('任务已停止', 'AbortError');
         }
 
-        const chunk = serializeSseEvent(event);
-        // A single-lane round streams straight into the task. In a multi-lane round each lane buffers
+        const chunk = hide(serializeSseEvent(event));
+        // A single-lane round streams straight into the task. Otherwise each lane buffers
         // privately and only the winning lane publishes, so parallel streams never interleave.
-        if (round.lanes.length === 1 || round.won) this.appendSummary(task, chunk);
+        if (round.solo || round.won) this.appendSummary(task, chunk);
         else lane.summary = truncateUtf8(`${lane.summary}${chunk}`, MAX_RESPONSE_SUMMARY_BYTES);
 
         const payload = parseSseJson(event);
@@ -434,14 +464,13 @@ export class LiveTaskEngine {
           this.emit(false);
           return;
         }
-        if (isSuccessEvent(task.config.channel, type)) {
+        if (isSuccessEvent(config.channel, type)) {
           if (!round.won) {
             accepted = true;
             this.clearLaneTimer(lane, 'firstEventTimer');
-            if (round.lanes.length > 1) task.responseSummary = lane.summary;
-            winRound(round, lane);
-            this.accept(task, type, token);
-          } else {
+            if (!round.solo) task.responseSummary = lane.summary;
+            round.win(lane, type);
+          } else if (!round.quiet) {
             this.addEvent(task, type, '收到流事件', '成功后的响应流仍在读取。', 'info');
             this.emit(false);
           }
@@ -449,56 +478,28 @@ export class LiveTaskEngine {
         }
 
         if (isFailureEvent(type)) {
-          const detail = sseErrorDetail(type, payload, event.data);
-          this.addEvent(task, type, accepted ? '成功后的流错误' : 'SSE 返回错误', detail, 'danger');
-          this.emit();
+          const detail = hide(sseErrorDetail(type, payload, event.data));
+          if (!round.quiet) {
+            this.addEvent(task, type, accepted ? '成功后的流错误' : 'SSE 返回错误', detail, 'danger');
+            this.emit();
+          }
           throw new ModelRequestError(detail, retryableModelError(detail));
         }
 
-        if (event.data !== '[DONE]') {
+        if (event.data !== '[DONE]' && !round.quiet) {
           this.addEvent(task, type, '收到 SSE 事件', '继续等待成功信号。', 'info');
           this.emit(false);
         }
       }, { signal: controller.signal, maxBytes: 2 * 1024 * 1024, onData: armIdleTimer });
 
-      if (lane.superseded) return { accepted: false };
-      this.clearLaneTimer(lane, 'firstEventTimer');
-      if (!this.isCurrent(task, generation)) return { accepted: false };
-      if (accepted || isAcceptedStatus(task.status)) {
-        task.status = 'accepted-completed';
-        task.completedAt = this.now();
-        task.updatedAt = this.now();
-        task.lastError = undefined;
-        this.addEvent(task, 'stream.completed', '响应流已结束', '成功连接已正常读取至结束。', 'success');
-        this.emit();
-        return { accepted: true };
-      }
-      return { accepted: false, sawEvent };
+      if (lane.superseded || !round.current()) return { accepted: false, stale: true };
+      return { accepted, sawEvent };
     } catch (error) {
-      if (lane.superseded) return { accepted: false };
-      this.clearLaneTimer(lane, 'firstEventTimer');
-      if (!this.isCurrent(task, generation)) return { accepted: false };
-      const rawDetail = timeoutDetail ?? errorMessage(error);
-      const detail = token
-        ? withApiHost(task.config.baseUrl, rawDetail)
-        : rawDetail;
-      if (accepted || isAcceptedStatus(task.status)) {
-        task.status = 'accepted-stream-interrupted';
-        task.completedAt = this.now();
-        task.updatedAt = this.now();
-        task.lastError = detail;
-        this.addEvent(
-          task,
-          'stream.interrupted',
-          '流已中断',
-          `${detail}；成功信号已经确认，不会重新请求模型。`,
-          'warning',
-        );
-        this.emit();
-        return { accepted: true };
-      }
+      if (lane.superseded || !round.current()) return { accepted: false, stale: true };
+      const rawDetail = hide(timeoutDetail ?? errorMessage(error));
+      const detail = token ? withApiHost(config.baseUrl, rawDetail) : rawDetail;
       return {
-        accepted: false,
+        accepted,
         detail,
         retryable: error instanceof ModelRequestError
           ? error.retryable
@@ -513,7 +514,7 @@ export class LiveTaskEngine {
     }
   }
 
-  private accept(task: Task, eventType: string, token: string): void {
+  protected accept(task: Task, eventType: string, token: string, member?: PoolMember): void {
     const runtime = this.ensureRuntime(task.id);
     if (runtime.retryTimer) globalThis.clearTimeout(runtime.retryTimer);
     runtime.retryTimer = undefined;
@@ -531,13 +532,14 @@ export class LiveTaskEngine {
       task,
       eventType,
       '已成功挤入',
-      task.config.keepalive ? '成功后按保活间隔继续请求；保活失败则恢复探活。' : `${eventType} 已到达；本任务成功后结束。`,
+      member ? `${member.alias} · 尾号 ${member.keyTail} 独自保活。`
+        : task.config.keepalive ? '成功后按保活间隔继续请求；保活失败则恢复探活。' : `${eventType} 已到达；本任务成功后结束。`,
       'success',
     );
     this.emit();
     if (shouldNotify) {
       task.lastNotifiedAt = now;
-      void this.startNotification(task, token);
+      void this.startNotification(task, token, member?.alias);
     }
   }
 
@@ -573,7 +575,7 @@ export class LiveTaskEngine {
     this.scheduleAttempt(task, Math.max(0, (task.lastAttemptAt ?? this.now()) + task.config.intervalSeconds * 1000 - this.now(), retryAfterMs));
   }
 
-  private exhaust(task: Task): void {
+  protected exhaust(task: Task): void {
     this.stopModelWork(task.id);
     task.status = 'exhausted';
     task.nextAttemptAt = undefined;
@@ -589,7 +591,7 @@ export class LiveTaskEngine {
     this.emit();
   }
 
-  private async startNotification(task: Task, token: string): Promise<void> {
+  private async startNotification(task: Task, token: string, member?: string): Promise<void> {
     if (!task.notificationConfigured || !task.acceptedAt) return;
     task.notificationStatus = 'queued';
     task.notificationId = undefined;
@@ -598,7 +600,7 @@ export class LiveTaskEngine {
 
     const payload: NotificationPayload = {
       taskId: `${task.id}:${task.acceptedAt}`,
-      taskName: task.config.name,
+      taskName: member ? `${task.config.name} · ${member}` : task.config.name,
       channel: task.config.channel,
       model: task.config.model,
       keyTail: keyTail(token),
@@ -626,7 +628,7 @@ export class LiveTaskEngine {
     }
   }
 
-  private scheduleNotificationPoll(task: Task): void {
+  protected scheduleNotificationPoll(task: Task): void {
     if (this.disposed || !this.tasks.has(task.id)) return;
     if (!pollingAvailable() || !notificationPending(task) || task.notificationPollingPaused) return;
     const runtime = this.ensureRuntime(task.id);
@@ -704,7 +706,7 @@ export class LiveTaskEngine {
     this.emit();
   }
 
-  private addEvent(
+  protected addEvent(
     task: Task,
     type: string,
     title: string,
@@ -724,12 +726,12 @@ export class LiveTaskEngine {
     );
   }
 
-  private isCurrent(task: Task, generation: number): boolean {
+  protected isCurrent(task: Task, generation: number): boolean {
     const runtime = this.runtimes.get(task.id);
     return !this.disposed && runtime?.generation === generation && this.tasks.has(task.id);
   }
 
-  private ensureRuntime(id: string): TaskRuntime {
+  protected ensureRuntime(id: string): TaskRuntime {
     const existing = this.runtimes.get(id);
     if (existing) return existing;
     const runtime: TaskRuntime = { generation: 0, lanes: new Set() };
@@ -737,7 +739,7 @@ export class LiveTaskEngine {
     return runtime;
   }
 
-  private stopModelWork(id: string): void {
+  protected stopModelWork(id: string): void {
     const runtime = this.runtimes.get(id);
     if (!runtime) return;
     runtime.generation += 1;
@@ -759,13 +761,13 @@ export class LiveTaskEngine {
     lane[name] = undefined;
   }
 
-  private clearLaneTimers(lane: AttemptLane): void {
+  protected clearLaneTimers(lane: AttemptLane): void {
     this.clearLaneTimer(lane, 'firstEventTimer');
     this.clearLaneTimer(lane, 'totalTimer');
     this.clearLaneTimer(lane, 'idleTimer');
   }
 
-  private clearAllRuntime(id: string): void {
+  protected clearAllRuntime(id: string): void {
     const runtime = this.runtimes.get(id);
     if (!runtime) return;
     this.stopModelWork(id);
@@ -773,7 +775,7 @@ export class LiveTaskEngine {
     runtime.notificationTimer = undefined;
   }
 
-  private emit(immediate = true): void {
+  protected emit(immediate = true): void {
     this.onChange(immediate);
   }
 }

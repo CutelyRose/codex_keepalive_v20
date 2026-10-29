@@ -26,23 +26,23 @@ async function request(path, body) {
 assert.equal((await fetch(origin)).status, 200);
 assert.equal((await fetch(origin + '/api/keys')).status, 401);
 await login();
-assert.equal((await request('/api/health')).python, true);
+assert.equal((await request('/api/health')).ok, true);
 assert.equal(execFileSync('docker', ['compose', 'exec', '-T', 'anyrouter', 'id', '-u'], { encoding: 'utf8' }).trim(), '1000');
 const key = await request('/api/keys', { alias: 'Container key', value: 'sk-container-test-only', baseUrl: 'http://127.0.0.1:1' });
-const task = await request('/api/python/tasks', {
+const task = await request('/api/tasks', {
   config: { name: 'Container persistence check', channel: 'gpt', keyId: key.id, baseUrl: 'http://127.0.0.1:1',
     model: 'gpt-ci', prompt: 'Reply OK', maxAttempts: 1, concurrency: 1, intervalSeconds: .5, timeoutSeconds: 30,
     keepalive: false, keepaliveMinSeconds: 60, keepaliveMaxSeconds: 90,
     telegramChatId: '', telegramBotToken: '', oneMillion: false },
 });
-await request(`/api/python/tasks/${task.id}/pause`, {});
-const saved = (await request('/api/python/tasks')).find(row => row.id === task.id);
+await request(`/api/tasks/${task.id}/pause`, {});
+const saved = (await request('/api/tasks')).find(row => row.id === task.id);
 assert.ok(['paused', 'exhausted'].includes(saved.status));
 assert.equal(JSON.stringify(saved).includes('sk-container-test-only'), false);
 execFileSync('docker', ['compose', 'restart'], { stdio: 'inherit' });
 let ready = false;
 for (let attempt = 0; attempt < 60; attempt++) {
-  try { ready = (await request('/api/health')).python; } catch { /* Container is starting. */ }
+  try { ready = (await request('/api/health')).ok; } catch { /* Container is starting. */ }
   if (ready) break;
   await delay(1000);
 }
@@ -50,7 +50,7 @@ assert.equal(ready, true, 'Container did not recover after restart');
 assert.equal((await request('/api/auth/session')).authenticated, false);
 await login();
 assert.deepEqual((await request('/api/keys')).find(row => row.id === key.id), key);
-const restored = (await request('/api/python/tasks')).find(row => row.id === task.id);
+const restored = (await request('/api/tasks')).find(row => row.id === task.id);
 assert.equal(restored.sessionId, saved.sessionId);
 assert.equal(restored.status, saved.status);
 await request('/api/auth/logout', {});

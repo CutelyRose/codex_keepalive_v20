@@ -400,9 +400,6 @@ class Runtime:
             message = self.poll.redact(message, result.job.settings.secrets)
             self._event(f"{task.label} {result.status or '超时'} · {message[:80]}", "error" if result.status != 200 else "warning")
 
-    def scheduled_externally(self, task):
-        return False
-
     def step(self):
         with self.lock:
             self.collect_notifications()
@@ -436,8 +433,6 @@ class Runtime:
                 return
             order = self.tasks[self.cursor:] + self.tasks[:self.cursor]
             for task in order:
-                if self.scheduled_externally(task):
-                    continue
                 if not task.args or task.error or (task.paused and not task.single):
                     continue
                 if self.count_limit and task.launched >= self.count_limit:

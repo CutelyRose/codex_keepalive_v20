@@ -1,10 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { poolFixture } from './pool-fixture.mjs';
-import { validatePoolTaskConfig } from '../dist/task-requests.mjs';
+import { validatePoolTaskConfig } from '../dist/server-core.mjs';
 
 async function until(check, message) {
   const deadline = Date.now() + 6000;
@@ -16,12 +14,7 @@ async function until(check, message) {
   assert.fail(message);
 }
 
-test('pool deadlines, cancellation and persistence with a controlled clock', () => {
-  execFileSync(process.env.ANYROUTER_PYTHON || (process.platform === 'win32' ? 'python' : 'python3'),
-    ['-B', '-X', 'utf8', 'tests/test_pool.py'], { cwd: fileURLToPath(new URL('../', import.meta.url)), windowsHide: true });
-});
-
-test('Python pool fans out across 12 keys, keeps one winner and survives stream faults and restart', async t => {
+test('server pool fans out across 12 keys, keeps one winner and survives stream faults and restart', async t => {
   const fixture = await poolFixture(24);
   t.after(() => fixture.close());
   const { config, keys, state, request } = fixture;
@@ -29,10 +22,10 @@ test('Python pool fans out across 12 keys, keeps one winner and survives stream 
   for (const invalid of [{ ...config, keyIds: [keys[0].id] }, { ...config, keyIds: [keys[0].id, keys[0].id] },
     { ...config, maxAttempts: 2 }, { ...config, keepalive: false }]) {
     assert.throws(() => validatePoolTaskConfig(invalid));
-    await request('/api/python/tasks', 'POST', { config: invalid }, 400);
+    await request('/api/tasks', 'POST', { config: invalid }, 400);
   }
-  const task = await request('/api/python/tasks', 'POST', { config }, 201);
-  const read = async () => (await request('/api/python/tasks')).find(item => item.id === task.id);
+  const task = await request('/api/tasks', 'POST', { config }, 201);
+  const read = async () => (await request('/api/tasks')).find(item => item.id === task.id);
   const won = await until(async () => { const task = await read(); return task.pool.phase === 'keeping' && task; }, 'pool did not select a winner');
   assert.equal(won.attemptsMade, 24);
   assert.equal(won.successes, 1);
@@ -64,25 +57,27 @@ test('Python pool fans out across 12 keys, keeps one winner and survives stream 
   for (const token of tokens) assert.equal(JSON.stringify(restored).includes(token.slice(7)), false, 'task view exposed credentials');
   state.mode = 'stable';
   await until(async () => (await read()).pool.phase === 'keeping', 'restored leader did not recover');
-  await request(`/api/python/tasks/${task.id}/pause`, 'POST', {});
+  await request(`/api/tasks/${task.id}/pause`, 'POST', {});
   const pausedCount = state.requests.length;
   await delay(650);
   assert.equal(state.requests.length, pausedCount);
   assert.equal((await read()).status, 'paused');
-  await request(`/api/python/tasks/${task.id}/resume`, 'POST', {});
+  await request(`/api/tasks/${task.id}/resume`, 'POST', {});
   await until(async () => (await read()).pool.phase === 'keeping', 'resume did not restore leader');
   for (const key of keys) {
     const sessions = new Set(state.requests.filter(item => item.token === 'Bearer ' + key.value).map(item => item.headers['session-id']));
     assert.equal(sessions.size, 1, 'member session changed');
   }
-  await request(`/api/keys/${keys[0].id}`, 'DELETE');
-  assert.equal((await read()).status, 'cancelled');
-  const restarted = await request(`/api/python/tasks/${task.id}/restart`, 'POST', {}, 201);
+  const restarted = await request(`/api/tasks/${task.id}/restart`, 'POST', {}, 201);
   assert.equal(restarted.pool.members.length, 12);
   assert.notEqual(restarted.pool.members[0].sessionId, won.pool.members[0].sessionId);
-  await request(`/api/python/tasks/${restarted.id}`, 'DELETE');
-  await request(`/api/python/tasks/${task.id}`, 'DELETE');
-  assert.equal((await request('/api/python/tasks')).length, 0);
+  await request(`/api/keys/${keys[0].id}`, 'DELETE');
+  assert.equal((await read()).status, 'cancelled');
+  assert.equal((await request('/api/tasks')).find(item => item.id === restarted.id).status, 'cancelled');
+  await request(`/api/tasks/${task.id}/restart`, 'POST', {}, 404);
+  await request(`/api/tasks/${restarted.id}`, 'DELETE');
+  await request(`/api/tasks/${task.id}`, 'DELETE');
+  assert.equal((await request('/api/tasks')).length, 0);
 });
 
 test('pool validates credentials and supports Claude success signals', async t => {
@@ -91,9 +86,9 @@ test('pool validates credentials and supports Claude success signals', async t =
   const { config, keys, request } = fixture;
   const duplicate = await request('/api/keys', 'POST', { alias: 'Duplicate', value: keys[0].value,
     baseUrl: fixture.baseUrl, authStatus: 'ready', models: ['gpt-pool'] }, 201);
-  await request('/api/python/tasks', 'POST', { config: { ...config, keyIds: [keys[0].id, duplicate.id] } }, 400);
-  const task = await request('/api/python/tasks', 'POST', { config: { ...config, keyIds: keys.slice(0, 2).map(key => key.id),
+  await request('/api/tasks', 'POST', { config: { ...config, keyIds: [keys[0].id, duplicate.id] } }, 400);
+  const task = await request('/api/tasks', 'POST', { config: { ...config, keyIds: keys.slice(0, 2).map(key => key.id),
     channel: 'claude', model: 'claude-pool', concurrency: 1 } }, 201);
-  await until(async () => (await request('/api/python/tasks')).some(item => item.id === task.id && item.successes >= 2), 'Claude pool did not keep alive');
-  await request(`/api/python/tasks/${task.id}/cancel`, 'POST', {});
+  await until(async () => (await request('/api/tasks')).some(item => item.id === task.id && item.successes >= 2), 'Claude pool did not keep alive');
+  await request(`/api/tasks/${task.id}/cancel`, 'POST', {});
 });

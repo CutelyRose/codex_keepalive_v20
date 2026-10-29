@@ -64,7 +64,7 @@ docker compose logs --tail=50
 curl -fsS http://127.0.0.1:8787/api/health
 ```
 
-健康接口无需登录，只返回 Node / Python 调度可用状态。登录页公开，Key 和任务接口要求登录。登录凭证使用 HttpOnly Cookie，有效期 7 天；退出登录、服务重启或修改管理密码后需重新登录。右上角可退出登录，Python 任务继续运行。
+健康接口无需登录，只返回服务是否可用。登录页公开，Key 和任务接口要求登录。登录凭证使用 HttpOnly Cookie，有效期 7 天；退出登录、服务重启或修改管理密码后需重新登录。右上角可退出登录，服务端任务继续运行。
 
 Key、别名、服务地址和模型缓存统一保存在数据卷内 `notifications.sqlite` 的 `api_keys` 表。原浏览器 Key 在首次进入工作区时迁入服务器，保留原 ID；全部写入成功后才清除本地副本，失败可重试。更换设备后登录同一站点，进入 Key 管理即可读取服务器列表。
 
@@ -74,9 +74,9 @@ Key、别名、服务地址和模型缓存统一保存在数据卷内 `notificat
 - **Server 酱**：填写 SendKey，支持 `SCT…`（Turbo）和 `sctp…`（Server 酱 3）；标签可填 `服务器报警|图片`。
 - **Telegram**：填写 Chat ID 和 Bot Token。
 
-浏览器、Python 两端共用通知队列。首次成功或故障恢复后通知，持续保活成功不重复推送，冷却 300 秒；临时失败最多投递 5 次，重启继续未完成通知。`sent` 表示通知平台接口已确认受理。
+浏览器、服务端两端共用通知队列。首次成功或故障恢复后通知，持续保活成功不重复推送，冷却 300 秒；临时失败最多投递 5 次，重启继续未完成通知。`sent` 表示通知平台接口已确认受理。
 
-创建任务可选浏览器、Python 或双端。关闭页面后需要继续运行的任务使用 Python；双端分别请求上游并独立计数。
+创建任务可选浏览器、服务端或双端。关闭页面后需要继续运行的任务使用服务端；双端分别请求上游并独立计数。服务端模型请求和通知遵守容器的 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 环境变量。
 
 ## 5. 更新、备份与恢复
 
@@ -89,7 +89,7 @@ docker compose up -d
 
 1Panel 直接创建的容器可重新拉取 `latest` 并重建，保留原数据卷和环境变量。每次发布也提供完整 Git 提交 SHA 标签；需要固定版本时，在 `.env` 设置 `ANYROUTER_IMAGE=ghcr.io/cutelyrose/codex_keepalive_v20:<完整提交SHA>`。
 
-保持同一 Compose 项目名和数据卷。重启后恢复启用任务，暂停和终态保持。SQLite 使用 WAL，备份前停止容器，再复制整个数据目录：
+保持同一 Compose 项目名和数据卷。服务端任务保存在 `notifications.sqlite` 的 `tasks` 表，重启后恢复启用任务，暂停和终态保持。SQLite 使用 WAL，备份前停止容器，再复制整个数据目录：
 
 ```sh
 docker compose stop
@@ -98,9 +98,9 @@ docker compose cp anyrouter:/app/any/data ./backup/
 docker compose start
 ```
 
-恢复时先停止容器，执行 `docker compose cp ./backup/data/. anyrouter:/app/any/data/`，通过 1Panel 将数据目录属主设为 `1000:1000`、目录权限 `700`、数据库权限 `600`，再启动。备份包含服务器 Key 和任务连接凭据，应保存在受限目录。
+恢复时先停止容器，执行 `docker compose cp ./backup/data/. anyrouter:/app/any/data/`，通过 1Panel 将数据目录属主设为 `1000:1000`、目录权限 `700`、数据库权限 `600`，再启动。备份包含服务器 Key 和通知凭据，应保存在受限目录。
 
-Windows 本地 Python 数据受当前用户 DPAPI 保护，不能直接复制到 Linux 容器；在部署站点重新添加 Key 和任务。浏览器 localStorage 随浏览器和站点地址区分，首次访问服务器站点需要重新配置浏览器任务。
+浏览器 localStorage 随浏览器和站点地址区分，首次访问服务器站点需要重新配置浏览器任务。
 
 ## 镜像发布与配置
 
@@ -117,4 +117,4 @@ Windows 本地 Python 数据受当前用户 DPAPI 保护，不能直接复制到
 | ANYROUTER_HOST | 服务监听地址，镜像已设为 0.0.0.0 |
 | ANYROUTER_PORT | 服务内部监听端口，镜像已设为 8787 |
 | ANYROUTER_DATA_DIR | 数据目录，镜像已设为 /app/any/data |
-| ANYROUTER_PYTHON | 本地运行时指定 Python 解释器，镜像使用 python3 |
+| HTTP_PROXY / HTTPS_PROXY / NO_PROXY | 可选，服务端请求使用的代理 |

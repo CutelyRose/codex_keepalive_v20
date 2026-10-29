@@ -77,7 +77,7 @@ function validateCommon<T extends ManagedTaskConfig>(input: T): T {
 
 export function validateTaskConfig(input: TaskConfig): TaskConfig {
   const config = validateCommon(input);
-  if ('keyIds' in config) throw new Error('Key 池只能通过 Python 池任务运行');
+  if ('keyIds' in config) throw new Error('Key 池只能通过服务端池任务运行');
   if (!Number.isSafeInteger(config.maxAttempts) || config.maxAttempts < 1) throw new Error('maxAttempts 超出范围');
   return { ...config, keyId: text(config.keyId, 'Key ID', 100), baseUrl: normalizeApiBaseUrl(config.baseUrl) };
 }

@@ -1,7 +1,7 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, get as httpGet } from 'node:http';
-import { execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve, basename } from 'node:path';
@@ -10,7 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { build } from 'esbuild';
 import { startServer } from '../server.mjs';
-import { serverchanEndpoint, validateTaskConfig } from '../dist/task-requests.mjs';
+import { serverchanEndpoint, validateTaskConfig } from '../dist/server-core.mjs';
 
 const directory = await mkdtemp(join(tmpdir(), 'anyrouter-check-'));
 after(async () => {
@@ -248,7 +248,7 @@ test('local server hosts both schedulers and durable notification delivery', asy
   const home = await fetch(app.url);
   assert.equal(home.status, 200);
   assert.match(home.headers.get('content-security-policy'), /connect-src 'self' https: http:/);
-  assert.deepEqual((await (await fetch(app.url + '/api/health')).json()).modelRequests, ['browser', 'python']);
+  assert.deepEqual(await (await fetch(app.url + '/api/health')).json(), { ok: true });
   for (const path of ['/api/proxy', '/api/keepalive/task', '/api/scheduled-keepalive/task']) {
     assert.equal((await post(path, {})).status, 404);
   }
@@ -278,25 +278,25 @@ test('local server hosts both schedulers and durable notification delivery', asy
       assert.equal(record.payload.botToken, undefined);
       assert.equal(record.payload.chatId, undefined);
     }
-    assert.equal(db.prepare("SELECT count(*) AS count FROM sqlite_master WHERE name='tasks'").get().count, 0);
+    assert.equal(db.prepare('SELECT count(*) AS count FROM tasks').get().count, 0);
   } finally { db.close(); }
 });
 
-test('browser and Python run together, recover keepalive and preserve backend ownership', async t => {
+test('browser and server run together, recover keepalive and preserve backend ownership', async t => {
   const seen = new Map(), requests = [];
   let closedLosers = 0;
   let finishParallel;
   const upstream = createServer(async (req, res) => {
     assert.equal(req.headers.authorization, 'Bearer sk-dual-test-only');
     res.setHeader('Content-Type', 'application/json');
-    if (req.url === '/v1/models') { res.end('{"data":[{"id":"gpt-browser"},{"id":"gpt-python"},{"id":"claude-python"}]}'); return; }
+    if (req.url === '/v1/models') { res.end('{"data":[{"id":"gpt-browser"},{"id":"gpt-server"},{"id":"claude-server"}]}'); return; }
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks));
     const count = (seen.get(body.model) ?? 0) + 1;
     seen.set(body.model, count);
     requests.push({ headers: req.headers, body });
-    if (body.model === 'gpt-fatal' || count === 2 && ['gpt-browser', 'gpt-python'].includes(body.model)) {
+    if (body.model === 'gpt-fatal' || count === 2 && ['gpt-browser', 'gpt-server'].includes(body.model)) {
       res.writeHead(body.model === 'gpt-fatal' ? 401 : 503);
       res.end('{"error":{"message":"' + (body.model === 'gpt-fatal' ? 'invalid_api_key' : 'busy') + '"}}'); return;
     }
@@ -329,14 +329,14 @@ test('browser and Python run together, recover keepalive and preserve backend ow
     await new Promise(resolveClose => upstream.close(resolveClose));
   });
   const call = async (path = '', method = 'GET', body) => {
-    const response = await fetch(`${app.url}/api/python/${path}`, {
+    const response = await fetch(`${app.url}/api/${path}`, {
       method, ...(body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}),
     });
     const result = await response.json();
     assert.equal(response.ok, true, JSON.stringify(result));
     return result;
   };
-  const config = { name: 'Dual keepalive', channel: 'gpt', keyId: 'dual', baseUrl, model: 'gpt-python', prompt: 'Reply OK',
+  const config = { name: 'Dual keepalive', channel: 'gpt', keyId: 'dual', baseUrl, model: 'gpt-server', prompt: 'Reply OK',
     maxAttempts: 2, concurrency: 1, intervalSeconds: .5, timeoutSeconds: 30, keepalive: true,
     keepaliveMinSeconds: .5, keepaliveMaxSeconds: .5, telegramChatId: '', telegramBotToken: '', oneMillion: false };
   await saveKey(app, { id: 'dual', alias: 'Dual', value: 'sk-dual-test-only', baseUrl });
@@ -344,108 +344,83 @@ test('browser and Python run together, recover keepalive and preserve backend ow
   assert.equal(auth.ok, true);
   const local = browser.create({ ...config, model: 'gpt-browser' });
   const remote = await call('tasks', 'POST', { config });
-  assert.equal(remote.scheduler, 'python');
+  assert.equal(remote.scheduler, 'server');
   assert.equal(JSON.stringify(remote).includes('sk-dual-test-only'), false);
-  await until(() => local.successes >= 2 && seen.get('gpt-python') >= 3, 'both schedulers failed to recover keepalive');
+  await until(() => local.successes >= 2 && seen.get('gpt-server') >= 3, 'both schedulers failed to recover keepalive');
   let rows = await call('tasks');
-  const recovered = await until(async () => (await call('tasks')).find(task => task.id === remote.id && task.successes >= 2), 'Python recovery not recorded');
+  const recovered = await until(async () => (await call('tasks')).find(task => task.id === remote.id && task.successes >= 2), 'server recovery not recorded');
   assert.equal(recovered.probeAttempts, 0);
   assert.deepEqual(recovered.events, []);
   const detailed = (await call(`tasks?detail=${remote.id}`)).find(task => task.id === remote.id);
   assert.equal(detailed.events.some(event => event.type === 'request.failed'), true);
   assert.equal(local.events.some(event => event.type === 'request.failed'), true);
-  for (const model of ['gpt-browser', 'gpt-python']) {
+  for (const model of ['gpt-browser', 'gpt-server']) {
     const modelRequests = requests.filter(item => item.body.model === model);
     assert.equal(new Set(modelRequests.map(item => item.headers['session-id'])).size, 1, 'keepalive changed sessions');
     for (const item of modelRequests) assert.equal(item.headers['session-id'], item.body.client_metadata.session_id);
   }
   assert.notEqual(local.sessionId, remote.sessionId);
   assert.equal(browser.pause(local.id), true);
-  const localCount = seen.get('gpt-browser'), pythonCount = seen.get('gpt-python');
+  const localCount = seen.get('gpt-browser'), serverCount = seen.get('gpt-server');
   browser.dispose();
-  await until(() => seen.get('gpt-python') > pythonCount, 'Python stopped when browser was disposed');
+  await until(() => seen.get('gpt-server') > serverCount, 'server stopped when browser was disposed');
   assert.equal(seen.get('gpt-browser'), localCount);
   await call(`tasks/${remote.id}/pause`, 'POST');
   await delay(100);
-  const pausedCount = seen.get('gpt-python');
+  const pausedCount = seen.get('gpt-server');
   await delay(650);
-  assert.equal(seen.get('gpt-python'), pausedCount, 'paused Python kept sending');
+  assert.equal(seen.get('gpt-server'), pausedCount, 'paused server task kept sending');
   await app.close(); app = await startServer(options);
   rows = await call('tasks');
   assert.equal(rows.find(task => task.id === remote.id).status, 'paused');
   await delay(600);
-  assert.equal(seen.get('gpt-python'), pausedCount, 'restart resumed a paused task');
+  assert.equal(seen.get('gpt-server'), pausedCount, 'restart resumed a paused task');
   await call(`tasks/${remote.id}/resume`, 'POST');
-  await until(() => seen.get('gpt-python') > pausedCount, 'Python did not resume');
+  await until(() => seen.get('gpt-server') > pausedCount, 'server task did not resume');
   await app.close();
-  const stoppedCount = seen.get('gpt-python');
+  const stoppedCount = seen.get('gpt-server');
   app = await startServer(options);
-  await until(() => seen.get('gpt-python') > stoppedCount, 'active task did not recover after service restart');
+  await until(() => seen.get('gpt-server') > stoppedCount, 'active task did not recover after service restart');
   await call(`tasks/${remote.id}/cancel`, 'POST');
 
   const parallel = await call('tasks', 'POST', { config: { ...config, model: 'gpt-parallel', keepalive: false, concurrency: 24, maxAttempts: 20 } });
-  const completed = await until(async () => (await call('tasks')).find(task => task.id === parallel.id && task.status === 'accepted-completed'), 'Python parallel round did not finish');
+  const completed = await until(async () => (await call('tasks')).find(task => task.id === parallel.id && task.status === 'accepted-completed'), 'server parallel round did not finish');
   assert.equal(completed.attemptsMade, 20);
   assert.equal(completed.successes, 1);
   assert.equal(closedLosers, 19);
-  const claude = await call('tasks', 'POST', { config: { ...config, channel: 'claude', model: 'claude-python[1m]', keepalive: false } });
-  await until(async () => (await call('tasks')).some(task => task.id === claude.id && task.status === 'accepted-completed'), 'Python Claude did not complete');
-  const claudeRequest = requests.find(item => item.body.model === 'claude-python');
+  const claude = await call('tasks', 'POST', { config: { ...config, channel: 'claude', model: 'claude-server[1m]', keepalive: false } });
+  await until(async () => (await call('tasks')).some(task => task.id === claude.id && task.status === 'accepted-completed'), 'server Claude did not complete');
+  const claudeRequest = requests.find(item => item.body.model === 'claude-server');
   assert.equal(claudeRequest.body.tools.length, 26);
   assert.match(claudeRequest.headers['anthropic-beta'], /context-1m/);
   const fixedLength = await call('tasks', 'POST', { config: { ...config, model: 'gpt-fixed-length', keepalive: false } });
-  await until(async () => (await call('tasks')).some(task => task.id === fixedLength.id && task.status === 'accepted-completed'), 'Python fixed-length SSE did not complete');
+  await until(async () => (await call('tasks')).some(task => task.id === fixedLength.id && task.status === 'accepted-completed'), 'server fixed-length SSE did not complete');
   const fatal = await call('tasks', 'POST', { config: { ...config, model: 'gpt-fatal' } });
-  await until(async () => (await call('tasks')).some(task => task.id === fatal.id && task.stopReason === 'permanent-error'), 'Python did not stop a permanent failure');
+  await until(async () => (await call('tasks')).some(task => task.id === fatal.id && task.stopReason === 'permanent-error'), 'server did not stop a permanent failure');
   assert.equal(seen.get('gpt-fatal'), 1);
   const held = await call('tasks', 'POST', { config: { ...config, model: 'gpt-held' } });
-  await until(() => seen.has('gpt-held'), 'Python held stream did not start');
+  await until(() => seen.has('gpt-held'), 'server held stream did not start');
   await call(`tasks/${held.id}`, 'DELETE');
-  await until(() => closedLosers === 20, 'Python delete did not stop the held stream');
+  await until(() => closedLosers === 20, 'server delete did not stop the held stream');
   assert.equal((await call('tasks')).some(task => task.id === held.id), false);
-  const invalid = await fetch(`${app.url}/api/python/tasks`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  const invalid = await fetch(`${app.url}/api/tasks`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ config: { ...config, keepaliveMinSeconds: 20, keepaliveMaxSeconds: 10 } }) });
   assert.equal(invalid.status, 400);
-  const db = new DatabaseSync(join(directory, 'dual', 'python-tasks.sqlite'), { readOnly: true });
-  try {
-    if (process.platform === 'win32') {
-      for (const row of db.prepare('SELECT payload FROM tasks').all()) assert.equal(Buffer.from(row.payload).includes(Buffer.from('sk-dual-test-only')), false);
-    }
-  } finally { db.close(); }
   await app.close();
-  execFileSync(process.env.ANYROUTER_PYTHON || (process.platform === 'win32' ? 'python' : 'python3'), ['-B', '-X', 'utf8', '-c', `
-import sys
-from unittest.mock import patch
-from python_scheduler import WebRuntime, poll
-
-with patch.object(WebRuntime, 'start'):
-    runtime = WebRuntime(sys.argv[1], 'http://127.0.0.1:1/api/notifications')
-try:
-    task = next(t for t in runtime.tasks if t.args.model == 'gpt-parallel')
-    data = runtime.entries[task.id]['task']
-    data.update(status='accepted-streaming', healthy=True)
-    task.paused = False
-    task.launched = 1
-    job = poll.Job(1, 'Reply OK', '', runtime.clock() - task.args.timeout - 1,
-                   task.session_id, settings=task.args, task_id=task.id)
-    task.awaiting[1] = (job, task.revision)
-    runtime.step()
-    assert data['status'] == 'accepted-stream-interrupted', data['status']
-    assert data['healthy'] and data['successes'] == 1
-    assert not runtime.records and not task.records
-    assert runtime.db.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
-    assert runtime.command('health', {}) is False
-finally:
-    runtime.close()
-`, join(directory, 'dual', 'python-tasks.sqlite')], { cwd: fileURLToPath(new URL('../', import.meta.url)), windowsHide: true });
+  const db = new DatabaseSync(options.dbPath, { readOnly: true });
+  try {
+    const rows = db.prepare('SELECT payload FROM tasks').all();
+    assert.ok(rows.length > 0);
+    for (const row of rows) assert.equal(row.payload.includes('sk-dual-test-only'), false, 'task records stored the API key');
+  } finally { db.close(); }
 });
 
-test('Python recognizes success before EOF and uses the same proxy as authentication', async t => {
+test('server recognizes success before EOF and uses the environment proxy for authentication and tasks', async t => {
   const streams = new Map(), requests = [];
   const target = 'http://anyrouter-proxy.invalid';
   const proxy = createServer(async (req, res) => {
     assert.equal(req.headers.authorization, 'Bearer sk-proxy-test-only');
-    requests.push(req.url);
+    requests.push(new URL(req.url, `http://${req.headers.host}`).href);
     if (new URL(req.url, target).pathname === '/v1/models') {
       res.setHeader('Content-Type', 'application/json');
       res.end('{"data":[{"id":"gpt-proxy"}]}'); return;
@@ -458,26 +433,35 @@ test('Python recognizes success before EOF and uses the same proxy as authentica
     res.write(`event: message\ndata: {"type":"${type}"}\n\n`);
     streams.set(body.model, res);
   });
+  // Tunnelled requests are answered by this same server, standing in for the unreachable target.
+  proxy.on('connect', (req, socket, head) => {
+    socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    if (head.length) socket.unshift(head);
+    proxy.emit('connection', socket);
+  });
   await new Promise(resolveListen => proxy.listen(0, '127.0.0.1', resolveListen));
   const proxyUrl = `http://127.0.0.1:${proxy.address().port}`;
-  let app;
+  const port = await new Promise(resolvePort => {
+    const probe = createServer().listen(0, '127.0.0.1', () => { const { port } = probe.address(); probe.close(() => resolvePort(port)); });
+  });
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/_proxy$/i.test(key)));
+  const child = spawn(process.execPath, ['--use-env-proxy', 'server.mjs'], {
+    cwd: fileURLToPath(new URL('../', import.meta.url)), windowsHide: true, stdio: ['ignore', 'pipe', 'inherit'],
+    env: { ...env, HTTP_PROXY: proxyUrl, HTTPS_PROXY: proxyUrl, NO_PROXY: '127.0.0.1,localhost',
+      ANYROUTER_PORT: String(port), ANYROUTER_DATA_DIR: join(directory, 'proxy') },
+  });
+  const exited = new Promise(resolveExit => child.once('exit', resolveExit));
   t.after(async () => {
-    await app?.close(); proxy.closeAllConnections();
+    child.kill(); await exited; proxy.closeAllConnections();
     await new Promise(resolveClose => proxy.close(resolveClose));
   });
-  const env = { http_proxy: proxyUrl, https_proxy: proxyUrl, no_proxy: '127.0.0.1,localhost' };
-  const saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
-  try {
-    Object.assign(process.env, env);
-    app = await startServer({ port: 0, dbPath: join(directory, 'proxy', 'notifications.sqlite') });
-  } finally {
-    for (const [key, value] of Object.entries(saved)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
+  await new Promise((resolveReady, reject) => {
+    child.stdout.on('data', chunk => { if (String(chunk).includes('AnyRouter console:')) resolveReady(); });
+    child.once('exit', code => reject(new Error(`server exited (${code})`)));
+  });
+  const app = { url: `http://127.0.0.1:${port}` };
   const call = async (path, body) => {
-    const response = await fetch(`${app.url}/api/python/${path}`, body ? {
+    const response = await fetch(`${app.url}/api/${path}`, body ? {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     } : {});
     const data = await response.json();
@@ -552,14 +536,14 @@ test('protected deployment delivers ServerChan from both schedulers and restores
     browser.dispose(); await app.close(); upstream.closeAllConnections();
     await new Promise(resolveClose => upstream.close(resolveClose));
   });
-  for (const path of ['/api/keys', '/api/python/tasks']) {
+  for (const path of ['/api/keys', '/api/tasks']) {
     const denied = await fetch(app.url + path);
     assert.equal(denied.status, 401);
     assert.equal(denied.headers.get('www-authenticate'), null);
   }
   for (const path of ['/', '/assets/app.js']) assert.equal((await fetch(app.url + path)).status, 200);
   assert.equal((await (await fetch(app.url + '/api/health')).json()).ok, true);
-  assert.equal((await request('/api/python/tasks', undefined, { Cookie: 'anyrouter_session=invalid' })).status, 401);
+  assert.equal((await request('/api/tasks', undefined, { Cookie: 'anyrouter_session=invalid' })).status, 401);
   const hostStatus = host => new Promise((resolveResponse, reject) => {
     httpGet(app.url, { headers: { Host: host, Cookie: cookie, Origin: options.origin,
       'X-Forwarded-Host': 'console.example.test' } }, response => {
@@ -568,7 +552,7 @@ test('protected deployment delivers ServerChan from both schedulers and restores
   });
   assert.equal(await hostStatus('untrusted.example'), 403);
   assert.equal(await hostStatus('console.example.test'), 200);
-  assert.equal((await request('/api/python/tasks', undefined, { Origin: 'https://untrusted.example' })).status, 403);
+  assert.equal((await request('/api/tasks', undefined, { Origin: 'https://untrusted.example' })).status, 403);
   assert.equal(serverchanEndpoint('sctp123tlocal_test'), 'https://123.push.ft07.com/send/sctp123tlocal_test.send');
   const config = { name: 'Browser ServerChan', channel: 'gpt', keyId: 'local', baseUrl, model: 'gpt-notice', prompt: 'Reply OK',
     maxAttempts: 1, concurrency: 1, intervalSeconds: .5, timeoutSeconds: 30, keepalive: false,
@@ -576,13 +560,13 @@ test('protected deployment delivers ServerChan from both schedulers and restores
     serverchanSendKey: 'SCTserverchan-test-only', serverchanTags: '服务器报警|图片', oneMillion: false };
   const local = browser.create(config);
   await saveKey(app, { id: 'local', alias: 'ServerChan', value: 'sk-serverchan-test-only', baseUrl }, cookie);
-  const created = await request('/api/python/tasks', { config: { ...config, name: 'Python ServerChan' } });
+  const created = await request('/api/tasks', { config: { ...config, name: 'Server ServerChan' } });
   assert.equal(created.status, 201);
   const remote = await created.json();
   assert.equal(remote.config.serverchanSendKey, '');
   await until(() => local.notificationStatus === 'sent', 'browser did not send ServerChan');
-  await until(async () => (await (await request('/api/python/tasks')).json()).some(task => task.id === remote.id && task.notificationStatus === 'sent'),
-    'Python authenticated notification callback did not send ServerChan');
+  await until(async () => (await (await request('/api/tasks')).json()).some(task => task.id === remote.id && task.notificationStatus === 'sent'),
+    'server task did not send ServerChan');
   assert.equal(messages.length, 2);
   assert.ok(messages.every(message => message.tags === '服务器报警|图片' && message.desp.includes('Key 尾号：only')));
   assert.equal(JSON.stringify(messages).includes(config.serverchanSendKey), false);
@@ -643,7 +627,7 @@ test('ShowDoc delivers from both schedulers, restores retries and protects push 
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   });
   const receipt = async id => (await fetch(`${app.url}/api/notifications/${id}`)).json();
-  const tasks = async () => (await fetch(app.url + '/api/python/tasks')).json();
+  const tasks = async () => (await fetch(app.url + '/api/tasks')).json();
   const browser = new LiveTaskEngine({ getKey: () => 'sk-showdoc-test-only', notificationPollMs: 10,
     notificationClient: { enqueue: async payload => (await post('/api/notifications', payload)).json(), get: receipt } });
   t.after(async () => {
@@ -656,13 +640,13 @@ test('ShowDoc delivers from both schedulers, restores retries and protects push 
     showdocPushUrl: showdocUrl, oneMillion: false };
   const local = browser.create(config);
   await saveKey(app, { id: 'local', alias: 'ShowDoc', value: 'sk-showdoc-test-only', baseUrl });
-  const created = await post('/api/python/tasks', { config: { ...config, name: 'Python ShowDoc' } });
+  const created = await post('/api/tasks', { config: { ...config, name: 'Server ShowDoc' } });
   assert.equal(created.status, 201);
   const remote = await created.json();
   assert.equal(remote.config.showdocPushUrl, '');
   assert.equal(remote.notificationConfigured, true);
   await until(() => local.notificationStatus === 'sent', 'browser did not send ShowDoc');
-  await until(async () => (await tasks()).some(task => task.id === remote.id && task.notificationStatus === 'sent'), 'Python did not send ShowDoc');
+  await until(async () => (await tasks()).some(task => task.id === remote.id && task.notificationStatus === 'sent'), 'server did not send ShowDoc');
   assert.equal(messages.length, 2);
   assert.ok(messages.every(message => message.title.startsWith('任务已接入：') && message.content.includes('Key 尾号：only')));
   assert.equal(JSON.stringify(messages).includes(showdocUrl), false);
@@ -685,11 +669,11 @@ test('ShowDoc delivers from both schedulers, restores retries and protects push 
   assert.equal((await (await post('/api/notifications', payload)).json()).id, pending.id);
   assert.equal(counts.get('任务已接入：Retry restart'), 2);
   clock = Date.now();
-  const restarted = await post(`/api/python/tasks/${remote.id}/restart`);
+  const restarted = await post(`/api/tasks/${remote.id}/restart`);
   assert.equal(restarted.status, 201);
   const again = await restarted.json();
   assert.equal(again.config.showdocPushUrl, '');
-  await until(async () => (await tasks()).some(task => task.id === again.id && task.notificationStatus === 'sent'), 'restarted Python task lost ShowDoc credentials');
+  await until(async () => (await tasks()).some(task => task.id === again.id && task.notificationStatus === 'sent'), 'restarted server task lost ShowDoc credentials');
   const db = new DatabaseSync(options.dbPath, { readOnly: true });
   try {
     assert.ok(db.prepare('SELECT payload FROM notifications').all().every(row => !row.payload.includes('showdoc-test-only')));
@@ -789,16 +773,16 @@ test('login protects shared server keys, migration is resumable and key data sur
   const config = { name: 'Shared credential task', channel: 'gpt', keyId: key.id, baseUrl: 'http://127.0.0.1:1',
     model: 'gpt-shared', prompt: 'Reply OK', maxAttempts: 1, concurrency: 1, intervalSeconds: .5, timeoutSeconds: 30,
     keepalive: false, keepaliveMinSeconds: 60, keepaliveMaxSeconds: 90, telegramChatId: '', telegramBotToken: '', oneMillion: false };
-  const created = await request('/api/python/tasks', 'POST', { config, token: 'sk-must-not-be-used' }, otherCookie);
+  const created = await request('/api/tasks', 'POST', { config, token: 'sk-must-not-be-used' }, otherCookie);
   assert.equal(created.status, 201);
   const task = await created.json();
   assert.equal(task.config.baseUrl, key.baseUrl);
-  await until(() => seen.some(item => item.url === '/changed/v1/responses'), 'Python did not use the server key address');
+  await until(() => seen.some(item => item.url === '/changed/v1/responses'), 'server did not use the server key address');
   assert.ok(seen.every(item => item.authorization === 'Bearer sk-shared-test-only'));
   assert.equal((await request(`/api/keys/${key.id}`, 'DELETE', undefined, otherCookie)).status, 200);
   await store.refreshKeys();
   assert.equal(store.keys.some(row => row.id === key.id), false);
-  const cancelled = (await (await request('/api/python/tasks', 'GET', undefined, cookie)).json()).find(row => row.id === task.id);
+  const cancelled = (await (await request('/api/tasks', 'GET', undefined, cookie)).json()).find(row => row.id === task.id);
   assert.equal(cancelled.status, 'cancelled');
   store.dispose();
 
@@ -823,7 +807,7 @@ test('stream progress batches storage writes while success, pagehide and pause p
   const descriptors = Object.fromEntries(Object.keys(replacements).map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
   for (const [key, value] of Object.entries(replacements)) Object.defineProperty(globalThis, key, { value, configurable: true });
   t.mock.method(globalThis, 'fetch', async url => {
-    if (url === '/api/python/tasks') return Response.json([]);
+    if (url === '/api/tasks') return Response.json([]);
     assert.equal(url, 'http://127.0.0.1:1/v1/responses');
     return new Response(new ReadableStream({ start(controller) { stream = controller; } }), { headers: { 'Content-Type': 'text/event-stream' } });
   });
