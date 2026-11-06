@@ -46,7 +46,7 @@ AppStore 合并两端任务。ID 与 scheduler 标识执行者，操作路由到
 
 GPT 头部与请求体见 `codex-contract.ts`，Claude 请求及 26 个工具定义见 `claude-contract.ts` 与 `contracts/claude-code-2.1.231-tools.json`。工具定义仅作为协议数据发送，不在本机执行。
 
-每个任务保持独立 sessionId，用于请求头、GPT client_metadata 和 prompt_cache_key；暂停、继续、保活均保留会话。重新开始创建新的任务和会话。
+每个任务保持一个 sessionId：GPT 用于 `Session-Id`、`Thread-Id`、`X-Client-Request-Id`、client_metadata、installation_id 和 prompt_cache_key，Claude 用于 `x-claude-code-session-id` 和 metadata.user_id（device_id 由它派生）。暂停、继续、保活、服务重启均保留会话。普通任务可在 `config.sessionId` 指定 UUID（如 `codex resume` 后面的 ID，大小写不限，保存为小写）；指定的会话随配置保存，重新开始沿用，双端创建时两个任务共用。未指定时随机生成，重新开始换新会话。只发送会话 ID，不发送原会话的历史消息。
 
 成功判定统一为 GPT `response.created` / `response.in_progress`、Claude `message_start`；HTTP 200 本身不足以确认成功。
 
@@ -77,7 +77,7 @@ healthy 保存最近轮次是否成功；attemptsMade 是累计实际请求数�
 
 ### 服务端 Key 池
 
-池配置与普通任务配置明确区分：池传 `keyIds: string[]`，至少两个不同 Key；不接受 `keyId`、`baseUrl` 或 `maxAttempts`，`keepalive` 固定为 `true`。其余模型、提示词、时间、每 Key 并发及通知字段共用验证。创建时按成员读取服务器 Key 的服务地址，每个成员生成独立会话；请求发出时按 Key ID 读取凭据。拒绝不同记录引用相同凭据或未通过鉴权的成员。
+池配置与普通任务配置明确区分：池传 `keyIds: string[]`，至少两个不同 Key；不接受 `keyId`、`baseUrl`、`maxAttempts` 或 `sessionId`，`keepalive` 固定为 `true`。其余模型、提示词、时间、每 Key 并发及通知字段共用验证。创建时按成员读取服务器 Key 的服务地址，每个成员生成独立会话；请求发出时按 Key ID 读取凭据。拒绝不同记录引用相同凭据或未通过鉴权的成员。
 
 公开任务包含 `pool: {phase, activeKeyId?, recoveryDeadline?, races, members}`；阶段为 `racing / keeping / recovering`，成员包含 Key ID、别名、尾号、地址、会话、计数和最近错误，不包含请求头或凭据。任务概要仍省略流摘要和事件；成员详情可直接随概要显示。
 

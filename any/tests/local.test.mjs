@@ -10,7 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { build } from 'esbuild';
 import { startServer } from '../server.mjs';
-import { serverchanEndpoint, validateTaskConfig } from '../dist/server-core.mjs';
+import { serverchanEndpoint, validateTaskConfig, validatePoolTaskConfig } from '../dist/server-core.mjs';
 
 const directory = await mkdtemp(join(tmpdir(), 'anyrouter-check-'));
 after(async () => {
@@ -102,6 +102,13 @@ test('large probe and concurrency settings persist without fixed caps', () => {
       assert.throws(() => validateTaskConfig({ ...config, [field]: value }));
     }
   }
+  assert.equal(validateTaskConfig({ ...config, sessionId: ' 01A1A51B-955A-71E3-BA60-E43ACD89D559 ' }).sessionId, '01a1a51b-955a-71e3-ba60-e43acd89d559');
+  assert.equal('sessionId' in validateTaskConfig({ ...config, sessionId: '' }), false);
+  for (const sessionId of ['not-a-uuid', '01a1a51b955a71e3ba60e43acd89d559', 123]) {
+    assert.throws(() => validateTaskConfig({ ...config, sessionId }), /会话 ID/);
+  }
+  const { keyId, baseUrl, maxAttempts, ...shared } = config;
+  assert.throws(() => validatePoolTaskConfig({ ...shared, keyIds: ['a', 'b'], keepalive: true, sessionId: '01a1a51b-955a-71e3-ba60-e43acd89d559' }), /会话 ID/);
 });
 
 test('browser engine sends direct GPT/Claude traffic, runs configured concurrency and cancels losing streams', async t => {
@@ -170,7 +177,14 @@ test('browser engine sends direct GPT/Claude traffic, runs configured concurrenc
   assert.equal(gpt.headers['session-id'], gpt.body.client_metadata.session_id);
   assert.equal(gpt.body.prompt_cache_key, gpt.headers['thread-id']);
 
-  const claude = engine.create({ ...config, channel: 'claude', model: 'claude-local[1m]', oneMillion: true });
+  const chosen = engine.create({ ...config, model: 'gpt-busy', sessionId: '01A1A51B-955A-71E3-BA60-E43ACD89D559' });
+  await until(() => chosen.status === 'accepted-completed', 'task with a chosen session did not complete');
+  assert.equal(chosen.sessionId, '01a1a51b-955a-71e3-ba60-e43acd89d559');
+  const chosenRequest = requests.findLast(request => request.path === '/v1/responses');
+  for (const value of [chosenRequest.headers['session-id'], chosenRequest.headers['thread-id'], chosenRequest.body.prompt_cache_key, chosenRequest.body.client_metadata.session_id]) {
+    assert.equal(value, chosen.sessionId);
+  }
+  const claude = engine.create({ ...config, channel: 'claude', model: 'claude-local[1m]', oneMillion: true, sessionId: chosen.sessionId });
   await until(() => claude.status === 'accepted-completed', 'Claude did not receive message_start');
   const message = requests.find(request => request.path === '/v1/messages?beta=true');
   assert.equal(message.body.model, 'claude-local');
@@ -178,6 +192,8 @@ test('browser engine sends direct GPT/Claude traffic, runs configured concurrenc
   assert.equal(message.headers['anthropic-dangerous-direct-browser-access'], 'true');
   assert.match(message.headers['anthropic-beta'], /context-1m/);
   assert.equal(message.body.tools.length, 26);
+  assert.equal(message.headers['x-claude-code-session-id'], chosen.sessionId);
+  assert.equal(JSON.parse(message.body.metadata.user_id).session_id, chosen.sessionId);
 
   const parallel = engine.create({ ...config, model: 'gpt-parallel', concurrency: 24, maxAttempts: 20 });
   await until(() => parallel.status === 'accepted-completed' && closedStreams === 19, 'configured parallel requests did not finish and cancel losing streams');
@@ -406,6 +422,15 @@ test('browser and server run together, recover keepalive and preserve backend ow
   const invalid = await fetch(`${app.url}/api/tasks`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ config: { ...config, keepaliveMinSeconds: 20, keepaliveMaxSeconds: 10 } }) });
   assert.equal(invalid.status, 400);
+  const sessionId = '01a1a51b-955a-71e3-ba60-e43acd89d559';
+  const chosen = await call('tasks', 'POST', { config: { ...config, model: 'gpt-fixed-length', keepalive: false, sessionId: sessionId.toUpperCase() } });
+  assert.equal(chosen.sessionId, sessionId);
+  const again = await call(`tasks/${chosen.id}/restart`, 'POST');
+  assert.equal(again.sessionId, sessionId, 'restart dropped the chosen session');
+  await until(() => requests.filter(item => item.body.model === 'gpt-fixed-length' && item.headers['session-id'] === sessionId).length === 2, 'server did not send the chosen session');
+  const badSession = await fetch(`${app.url}/api/tasks`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config: { ...config, sessionId: 'not-a-uuid' } }) });
+  assert.equal(badSession.status, 400);
   await app.close();
   const db = new DatabaseSync(options.dbPath, { readOnly: true });
   try {

@@ -76,10 +76,15 @@ function validateCommon<T extends ManagedTaskConfig>(input: T): T {
 }
 
 export function validateTaskConfig(input: TaskConfig): TaskConfig {
-  const config = validateCommon(input);
+  const { sessionId, ...config } = validateCommon(input);
   if ('keyIds' in config) throw new Error('Key 池只能通过服务端池任务运行');
   if (!Number.isSafeInteger(config.maxAttempts) || config.maxAttempts < 1) throw new Error('maxAttempts 超出范围');
-  return { ...config, keyId: text(config.keyId, 'Key ID', 100), baseUrl: normalizeApiBaseUrl(config.baseUrl) };
+  const session = sessionId === undefined ? '' : String(sessionId).trim().toLowerCase();
+  if (session && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(session)) {
+    throw new Error('会话 ID 须为 UUID，例如 codex resume 后面的 ID');
+  }
+  return { ...config, keyId: text(config.keyId, 'Key ID', 100), baseUrl: normalizeApiBaseUrl(config.baseUrl),
+    ...(session ? { sessionId: session } : {}) };
 }
 
 export function validatePoolTaskConfig(input: PoolTaskConfig): PoolTaskConfig {
@@ -88,6 +93,8 @@ export function validatePoolTaskConfig(input: PoolTaskConfig): PoolTaskConfig {
   const keyIds = config.keyIds.map(id => text(id, 'Key ID', 100));
   if (new Set(keyIds).size !== keyIds.length) throw new Error('Key 池不能包含重复成员');
   if (!config.keepalive) throw new Error('Key 池必须开启保活');
-  if ('keyId' in config || 'baseUrl' in config || 'maxAttempts' in config) throw new Error('Key 池不接受单 Key 地址或探活次数上限');
+  if ('keyId' in config || 'baseUrl' in config || 'maxAttempts' in config || 'sessionId' in config) {
+    throw new Error('Key 池不接受单 Key 地址、探活次数上限或指定会话 ID');
+  }
   return { ...config, keyIds, keepalive: true };
 }

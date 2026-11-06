@@ -60,9 +60,11 @@ try {
   await send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1050, deviceScaleFactor: 1, mobile: false });
   await send('Page.navigate', { url: fixture.url + '/#create' });
   await until(() => evaluate("Boolean(document.querySelector('[name=taskKind]'))"), 'task form did not load');
+  assert.equal(await evaluate("Boolean(document.querySelector('[name=sessionId]'))"), true, 'single task form has no session field');
   await evaluate("document.querySelector('[name=taskKind]').value='pool'; document.querySelector('[name=taskKind]').dispatchEvent(new Event('change',{bubbles:true})); true");
   assert.equal(await evaluate("document.querySelectorAll('[name=poolKeyIds]').length"), 12);
   assert.equal(await evaluate("Boolean(document.querySelector('[name=maxAttempts]'))"), false);
+  assert.equal(await evaluate("Boolean(document.querySelector('[name=sessionId]'))"), false, 'pool form shows a session field');
   assert.equal(await evaluate("document.querySelector('[name=scheduler]').value"), 'server');
   await evaluate("document.querySelector('[name=poolKeyIds]').click(); document.querySelectorAll('[name=poolKeyIds]')[1].click(); true");
   assert.equal(await evaluate("document.querySelectorAll('[name=poolKeyIds]:checked').length"), 2);

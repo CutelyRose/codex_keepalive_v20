@@ -49,6 +49,7 @@ interface TaskDraft extends NotificationSettings {
   modelChoice: string;
   customModel: string;
   prompt: string;
+  sessionId: string;
   maxAttempts: number;
   intervalSeconds: number;
   timeoutSeconds: number;
@@ -580,6 +581,7 @@ export class AppShell extends HTMLElement {
             <div class="form-section-head"><span class="step-number">03</span><div><h2 id="probe-heading">探针与重试策略</h2><p>每一轮可并行发起多个探针，先挤入者结束该轮，其余线程立即停止。</p></div></div>
             <label class="field"><span>任务名称</span><input name="name" value="${escapeHtml(this.taskDraft.name)}" maxlength="60" required /></label>
             <label class="field"><span>探针提示词</span><textarea name="prompt" rows="3" maxlength="1000" required>${escapeHtml(this.taskDraft.prompt)}</textarea><small>默认只要求返回 OK，以降低探针开销。</small></label>
+            ${pool ? '' : `<label class="field"><span>会话 ID（可选）</span><input name="sessionId" value="${escapeHtml(this.taskDraft.sessionId)}" maxlength="36" pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" placeholder="留空自动生成，例如 codex resume 后面的 ID" spellcheck="false" autocomplete="off" /><small>任务的所有请求都使用这个会话；双端调度时两个任务共用。</small></label>`}
             <div class="field-grid two-cols">
               ${pool ? '<p class="field-help">持续重试，直到成功或手动停止。</p>' : numberField('maxAttempts', '每轮探活上限', this.taskDraft.maxAttempts, LIMITS.attempts.min, undefined, 1, '次')}
               ${numberField('concurrency', pool ? '每个 Key 的探活并发' : '并发线程', this.taskDraft.concurrency, LIMITS.concurrency.min, undefined, 1, '线程')}
@@ -809,6 +811,7 @@ export class AppShell extends HTMLElement {
             </div>
             <dl class="detail-grid">
               <div><dt>调度端</dt><dd>${task.scheduler === 'server' ? '服务端后台' : '当前浏览器'}</dd></div>
+              <div><dt>会话 ID</dt><dd>${task.pool ? '按池成员分别使用' : escapeHtml(task.sessionId)}</dd></div>
               <div><dt>自动保活</dt><dd>${task.config.keepalive ? `${task.config.keepaliveMinSeconds}–${task.config.keepaliveMaxSeconds} 秒` : '关闭'}</dd></div>
               <div><dt>实际模型</dt><dd>${escapeHtml(task.config.model)}</dd></div>
               <div><dt>通道</dt><dd>${task.config.channel === 'gpt' ? 'GPT · /v1/responses' : 'Claude · /v1/messages?beta=true'}</dd></div>
@@ -1005,7 +1008,8 @@ export class AppShell extends HTMLElement {
     const config: TaskConfig = {
       name: String(data.get('name')).trim(),
       channel,
-      ...(pool ? { keyIds, keepalive: true as const } : { keyId, baseUrl: key.baseUrl, maxAttempts: Number(data.get('maxAttempts')), keepalive: data.get('keepalive') === 'on' }),
+      ...(pool ? { keyIds, keepalive: true as const } : { keyId, baseUrl: key.baseUrl, maxAttempts: Number(data.get('maxAttempts')), keepalive: data.get('keepalive') === 'on',
+        sessionId: String(data.get('sessionId') ?? '') }),
       model,
       prompt: String(data.get('prompt')).trim(),
       intervalSeconds: Number(data.get('intervalSeconds')),
@@ -1338,6 +1342,7 @@ export class AppShell extends HTMLElement {
       modelChoice: String(data.get('modelChoice') ?? this.taskDraft.modelChoice),
       customModel: String(data.get('customModel') ?? this.taskDraft.customModel),
       prompt: String(data.get('prompt') ?? this.taskDraft.prompt),
+      sessionId: String(data.get('sessionId') ?? this.taskDraft.sessionId),
       maxAttempts: Number(data.get('maxAttempts') ?? this.taskDraft.maxAttempts),
       intervalSeconds: Number(data.get('intervalSeconds') ?? this.taskDraft.intervalSeconds),
       timeoutSeconds: Number(data.get('timeoutSeconds') ?? this.taskDraft.timeoutSeconds),
@@ -1385,6 +1390,7 @@ export class AppShell extends HTMLElement {
       modelChoice: preferredModel(models, channel),
       customModel: '',
       prompt: '请只返回 OK。',
+      sessionId: '',
       maxAttempts: this.store.settings.attempts,
       intervalSeconds: this.store.settings.intervalSeconds,
       timeoutSeconds: this.store.settings.timeoutSeconds,

@@ -47,8 +47,10 @@ export interface TaskConfig extends NotificationSettings {
   keepaliveMinSeconds: number;
   keepaliveMaxSeconds: number;
   oneMillion: boolean;
+  /** UUID used for every request of the task, e.g. the ID after `codex resume`; generated when omitted. */
+  sessionId?: string;
 }
-export type PoolTaskConfig = Omit<TaskConfig, 'keyId' | 'baseUrl' | 'maxAttempts' | 'keepalive'> & {
+export type PoolTaskConfig = Omit<TaskConfig, 'keyId' | 'baseUrl' | 'maxAttempts' | 'keepalive' | 'sessionId'> & {
   keyIds: string[];
   keepalive: true;
 };

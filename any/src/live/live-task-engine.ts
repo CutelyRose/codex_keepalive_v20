@@ -174,7 +174,7 @@ export class LiveTaskEngine {
     const task: Task = {
       id: makeId('task'),
       scheduler: this.scheduler,
-      sessionId: randomUUID(),
+      sessionId: config.sessionId ?? randomUUID(),
       config: { ...config },
       status: 'running',
       attemptsMade: 0,
